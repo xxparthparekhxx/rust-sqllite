@@ -10,6 +10,8 @@ Database files are fully compatible with the official SQLite 3 format and can be
 - **Record Format** — Rows serialized using SQLite's standard serial type system (big-endian, variable-width integers)
 - **`sqlite_schema` Table** — Standard system catalog on Page 1 for tool compatibility
 - **B-Tree Engine** — Table B-Trees with `u64` rowids, cell pointer arrays, and page splitting
+- **Automatic Indexes** — Every `UNIQUE` column, and every `PRIMARY KEY` that is not `INTEGER PRIMARY KEY`, gets the `sqlite_autoindex_<table>_<n>` index SQLite expects: an index B-Tree kept up to date on `INSERT`, `UPDATE` and `DELETE`, which `sqlite3` uses for lookups
+- **Freelist** — Pages released by index merges and `DROP TABLE` go on SQLite's freelist and are reused
 - **Write-Ahead Logging (WAL)** — Crash-safe atomic commits with checkpoint support
 - **4KB Paged Storage** — LRU-cached page I/O with proper 1-based page indexing
 - **SQL Parser** — Hand-written recursive descent parser supporting:
@@ -19,7 +21,7 @@ Database files are fully compatible with the official SQLite 3 format and can be
   - `UPDATE` with `WHERE`
   - `DELETE` with `WHERE`
   - `BEGIN` / `COMMIT` / `ROLLBACK` transactions
-- **Column Constraints** — `PRIMARY KEY`, `AUTOINCREMENT`, `NOT NULL`, `UNIQUE`, `DEFAULT`
+- **Column Constraints** — `PRIMARY KEY`, `AUTOINCREMENT`, `NOT NULL`, `UNIQUE`, `DEFAULT` (`UNIQUE` and non-integer `PRIMARY KEY` are enforced through their automatic index, on both `INSERT` and `UPDATE`)
 - **Data Types** — `INTEGER`, `TEXT`, `REAL`, `BLOB`, `NULL`
 - **Interactive REPL** — Pretty-printed table output with box-drawing characters
 
@@ -66,7 +68,8 @@ src/
 ├── main.rs      # Interactive REPL with dot-commands
 ├── sql.rs       # Tokenizer + recursive descent SQL parser
 ├── engine.rs    # Query execution engine & catalog management
-├── btree.rs     # B-Tree implementation (search, insert, delete, scan)
+├── btree.rs     # Table B-Tree implementation (search, insert, delete, scan)
+├── index.rs     # Index B-Tree for automatic indexes (insert, delete, split, merge)
 ├── pager.rs     # Page-based I/O with LRU cache & file header
 ├── wal.rs       # Write-Ahead Logging for crash safety
 ├── schema.rs    # SQLite Record Format serialization & table definitions
@@ -107,21 +110,23 @@ db.close().unwrap();
 cargo test
 ```
 
-Includes 33 unit tests, 17 integration tests, and doc tests covering the B-Tree, pager, WAL, SQL parser, record format, and full engine operations.
+Includes 43 unit tests, 28 integration tests, and doc tests covering the B-Trees, pager, WAL, SQL parser, record format, and full engine operations. The tests in `tests/autoindex.rs` run the `sqlite3` CLI (when installed) to check `PRAGMA integrity_check`, query plans and query results on files this engine wrote.
 
 ## 📋 SQLite Compatibility
 
 | Feature | Status |
 |---------|--------|
 | File header (100 bytes) | ✅ |
-| B-Tree page types (0x0D, 0x05) | ✅ |
+| B-Tree page types (0x0D, 0x05, 0x0A, 0x02) | ✅ |
 | Varint encoding | ✅ |
 | Record format (serial types) | ✅ |
 | `sqlite_schema` system table | ✅ |
 | `PRAGMA integrity_check` | ✅ Passes |
 | DB Browser / sqlite3 CLI | ✅ Works |
+| Freelist (free and reuse pages) | ✅ |
+| Automatic indexes (`UNIQUE`, non-integer `PRIMARY KEY`) | ✅ Keys up to 1002 bytes |
 | Overflow pages | ❌ Not yet |
-| Indexes | ❌ Not yet |
+| `CREATE INDEX` / multi-column indexes | ❌ Not yet |
 | `JOIN` / subqueries | ❌ Not yet |
 | WAL mode (-wal/-shm) | ⚠️ Custom format |
 
