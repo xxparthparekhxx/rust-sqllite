@@ -237,6 +237,22 @@ fn rowid_column(table: &Table) -> Option<usize> {
         .position(|c| c.is_primary_key && c.data_type == crate::schema::DataType::Integer)
 }
 
+/// Fail if `row` puts NULL in a NOT NULL column, as SQLite does on INSERT and UPDATE.
+/// An INTEGER PRIMARY KEY is skipped: its value is the rowid, which is never NULL.
+/// SQLite does not even store it in the record (files it writes hold NULL there),
+/// and setting it to NULL fails with "datatype mismatch" instead (see exec_update).
+fn check_not_null(table: &Table, row: &[Value]) -> io::Result<()> {
+    for (col, value) in table.columns.iter().zip(row) {
+        if col.is_not_null && !col.is_rowid_alias && *value == Value::Null {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("NOT NULL constraint failed: {}.{}", table.name, col.name),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn read_be_u32(buf: &[u8], off: usize) -> u32 {
     u32::from_be_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
 }
@@ -818,23 +834,10 @@ impl Engine {
 
             let key = rowid as u64;
 
-            // ── Constraint enforcement ──
-            // NOT NULL: a NOT NULL column may not be NULL.
-            for (idx, col) in table.columns.iter().enumerate() {
-                if col.is_not_null && row_values[idx] == Value::Null {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!(
-                            "NOT NULL constraint failed: {}.{}",
-                            table_name, col.name
-                        ),
-                    ));
-                }
-            }
-
-            // The rowid (the INTEGER PRIMARY KEY) must be free, then the UNIQUE and
-            // non-rowid PRIMARY KEY columns are checked through their indexes, in
-            // SQLite's order. A failure undoes the whole statement (see `atomic`).
+            // ── Constraint enforcement ──, in SQLite's order: NOT NULL, then the
+            // rowid, then the UNIQUE and non-rowid PRIMARY KEY columns (through
+            // their indexes). A failure undoes the whole statement (see `atomic`).
+            check_not_null(&table, &row_values)?;
             self.check_rowid_free(&table, key)?;
             self.check_unique(&table, &row_values, rowid, None)?;
 
@@ -1117,14 +1120,20 @@ impl Engine {
         let mut count = 0u64;
         let mut updates: Vec<(u64, Row, Row)> = Vec::new();
 
+        let alias_col = table.columns.iter().position(|c| c.is_rowid_alias);
         for (key, value) in &all_kv {
-            let old_row = deserialize_row(value)?;
-            let mut row = old_row.clone();
+            let mut old_row = deserialize_row(value)?;
             if let Some(wc) = where_clause {
-                if !self.eval_where(wc, &row, &table)? {
+                if !self.eval_where(wc, &old_row, &table)? {
                     continue;
                 }
             }
+            // An INTEGER PRIMARY KEY's value is the rowid; files written by SQLite
+            // hold NULL in its place in the record.
+            if let Some(c) = alias_col.filter(|&c| old_row[c] == Value::Null) {
+                old_row[c] = Value::Integer(*key as i64);
+            }
+            let mut row = old_row.clone();
             // Apply assignments.
             for (col_name, expr) in assignments {
                 let idx = table
@@ -1139,6 +1148,9 @@ impl Engine {
                     })?;
                 row[idx] = self.eval_expr_with_row(expr, &row, &table)?;
             }
+            // NOT NULL depends on the new row alone: check every row before
+            // anything is written.
+            check_not_null(&table, &row)?;
             updates.push((*key, old_row, row));
             count += 1;
         }

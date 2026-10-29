@@ -1,7 +1,7 @@
-//! INTEGER PRIMARY KEY uniqueness, checked against the real `sqlite3` CLI. The
-//! expected errors are the messages sqlite3 3.50 gives for the same statements. A
-//! rejected statement must write nothing: the WAL, where every committed page goes,
-//! must not grow.
+//! INTEGER PRIMARY KEY uniqueness and NOT NULL on UPDATE, checked against the real
+//! `sqlite3` CLI. The expected errors are the messages sqlite3 3.50 gives for the
+//! same statements. A rejected statement must write nothing: the WAL, where every
+//! committed page goes, must not grow.
 
 mod common;
 
@@ -119,5 +119,100 @@ fn update_to_a_taken_integer_primary_key_is_rejected() {
         assert_eq!(out, "7|20");
     }
     db.close().unwrap();
+    cleanup(&path);
+}
+
+#[test]
+fn update_rejects_null_in_a_not_null_column_before_writing() {
+    let path = tmp_db("update_not_null");
+    let mut db = Database::open(&path).unwrap();
+    exec(
+        &mut db,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL, note TEXT);",
+    );
+    exec(
+        &mut db,
+        "INSERT INTO t VALUES (1, 'a', 'x'), (2, 'b', 'y'), (3, 'c', NULL);",
+    );
+
+    let wal = wal_len(&path);
+    let null = "NOT NULL constraint failed: t.name";
+    assert_error(&mut db, "UPDATE t SET name = NULL WHERE id = 2;", null);
+    assert_error(&mut db, "UPDATE t SET name = NULL;", null);
+    // Only the last row gets a NULL: the rows before it are not changed either.
+    assert_error(&mut db, "UPDATE t SET name = note;", null);
+    // NOT NULL is checked before the rowid, as SQLite does.
+    assert_error(
+        &mut db,
+        "UPDATE t SET name = NULL, id = 1 WHERE id = 2;",
+        null,
+    );
+    assert_eq!(wal_len(&path), wal, "a rejected UPDATE wrote pages");
+
+    // NULL in a column without NOT NULL is fine.
+    assert_eq!(exec(&mut db, "UPDATE t SET note = NULL WHERE id = 1;"), 1);
+    // Inside a transaction, the failed statement is undone and the rest kept.
+    exec(&mut db, "BEGIN;");
+    exec(&mut db, "UPDATE t SET name = 'B' WHERE id = 2;");
+    assert_error(&mut db, "UPDATE t SET name = NULL WHERE id = 1;", null);
+    exec(&mut db, "COMMIT;");
+    let rows = db.execute("SELECT * FROM t;").unwrap().rows;
+    assert_eq!(as_sqlite_text(&rows), "1|a|\n2|B|y\n3|c|");
+
+    // A NOT NULL column with an index: neither the row nor the index changes.
+    exec(
+        &mut db,
+        "CREATE TABLE w (id INTEGER PRIMARY KEY, email TEXT UNIQUE NOT NULL);",
+    );
+    exec(&mut db, "INSERT INTO w VALUES (1, 'a'), (2, 'b');");
+    let wal = wal_len(&path);
+    assert_error(
+        &mut db,
+        "UPDATE w SET email = NULL WHERE id = 2;",
+        "NOT NULL constraint failed: w.email",
+    );
+    assert_eq!(wal_len(&path), wal, "a rejected UPDATE wrote pages");
+
+    db = close_and_check(db, &path, "t", "table t");
+    db = close_and_check(db, &path, "w", "table w");
+    if let Some(out) = sqlite3(&path, "SELECT id FROM w WHERE email = 'b';") {
+        assert_eq!(out, "2");
+    }
+    db.close().unwrap();
+    cleanup(&path);
+}
+
+#[test]
+fn not_null_integer_primary_key_in_a_file_written_by_sqlite3() {
+    // sqlite3 stores NULL in the record for an INTEGER PRIMARY KEY, whose value is
+    // the rowid, so NOT NULL must not be applied to that column on UPDATE.
+    let path = tmp_db("sqlite3_written");
+    let created = sqlite3(
+        &path,
+        "PRAGMA page_size = 4096;
+         CREATE TABLE x (id INTEGER PRIMARY KEY NOT NULL, v TEXT NOT NULL);
+         INSERT INTO x (v) VALUES ('a'), ('b');",
+    );
+    if created.is_none() {
+        return;
+    }
+    let mut db = Database::open(&path).unwrap();
+    assert_eq!(exec(&mut db, "UPDATE x SET v = 'z' WHERE v = 'b';"), 1);
+    assert_error(
+        &mut db,
+        "UPDATE x SET v = NULL;",
+        "NOT NULL constraint failed: x.v",
+    );
+    // As in sqlite3, NULL for the INTEGER PRIMARY KEY is a datatype mismatch.
+    assert_error(
+        &mut db,
+        "UPDATE x SET id = NULL WHERE v = 'a';",
+        "datatype mismatch",
+    );
+    db.close().unwrap();
+    assert_integrity_ok(&path, "table x");
+    if let Some(out) = sqlite3(&path, "SELECT * FROM x ORDER BY id;") {
+        assert_eq!(out, "1|a\n2|z");
+    }
     cleanup(&path);
 }

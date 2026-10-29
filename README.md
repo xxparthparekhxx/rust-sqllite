@@ -21,7 +21,7 @@ Database files are fully compatible with the official SQLite 3 format and can be
   - `UPDATE` with `WHERE`
   - `DELETE` with `WHERE`
   - `BEGIN` / `COMMIT` / `ROLLBACK` transactions
-- **Column Constraints** — `PRIMARY KEY`, `AUTOINCREMENT`, `NOT NULL`, `UNIQUE`, `DEFAULT` (`UNIQUE` and `PRIMARY KEY` are enforced on both `INSERT` and `UPDATE`: an `INTEGER PRIMARY KEY` as the rowid, so a duplicate id is rejected rather than overwriting the row, and `UNIQUE` and non-integer `PRIMARY KEY` through their automatic index)
+- **Column Constraints** — `PRIMARY KEY`, `AUTOINCREMENT`, `NOT NULL`, `UNIQUE`, `DEFAULT` (`NOT NULL`, `UNIQUE` and `PRIMARY KEY` are enforced on both `INSERT` and `UPDATE`, and a statement that breaks one changes nothing: an `INTEGER PRIMARY KEY` as the rowid, so a duplicate id is rejected rather than overwriting the row, and `UNIQUE` and non-integer `PRIMARY KEY` through their automatic index)
 - **Data Types** — `INTEGER`, `TEXT`, `REAL`, `BLOB`, `NULL`
 - **Interactive REPL** — Pretty-printed table output with box-drawing characters
 
@@ -110,7 +110,7 @@ db.close().unwrap();
 cargo test
 ```
 
-Includes 48 unit tests, 35 integration tests, and doc tests covering the B-Trees, pager, WAL, SQL parser, record format, and full engine operations. The tests in `tests/autoindex.rs`, `tests/table_delete.rs` and `tests/constraints.rs` run the `sqlite3` CLI (when installed) to check `PRAGMA integrity_check`, query plans and query results on files this engine wrote.
+Includes 48 unit tests, 37 integration tests, and doc tests covering the B-Trees, pager, WAL, SQL parser, record format, and full engine operations. The tests in `tests/autoindex.rs`, `tests/table_delete.rs` and `tests/constraints.rs` run the `sqlite3` CLI (when installed) to check `PRAGMA integrity_check`, query plans and query results on files this engine wrote.
 
 ## 📋 SQLite Compatibility
 
