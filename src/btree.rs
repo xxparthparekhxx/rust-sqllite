@@ -411,18 +411,26 @@ fn insert_recursive(
                 } else {
                     // Split this internal node.
                     let mut cells = collect_internal_cells(&page);
-                    let rc = right_child(&page);
+                    let mut rc = right_child(&page);
 
-                    // Find the cell referencing child_page, replace its separator key with
-                    // median_key (max key of the now-smaller child_page), and insert
-                    // (new_page, old_key) right after it (old_key = max key of new_page).
-                    let child_idx = cells
-                        .iter()
-                        .position(|(cp, _)| *cp == child_page)
-                        .expect("child_page must be referenced by a cell");
-                    let old_key = cells[child_idx].1;
-                    cells[child_idx] = (child_page, median_key);
-                    cells.insert(child_idx + 1, (new_page, old_key));
+                    match child_idx {
+                        // Replace the separator key of the cell referencing child_page
+                        // with median_key (max key of the now-smaller child_page), and
+                        // insert (new_page, old_key) right after it (old_key = max key
+                        // of new_page).
+                        Some(i) => {
+                            let i = i as usize;
+                            let old_key = cells[i].1;
+                            cells[i] = (child_page, median_key);
+                            cells.insert(i + 1, (new_page, old_key));
+                        }
+                        // The right child split: it keeps the keys up to median_key
+                        // behind a new last cell, and new_page becomes the right child.
+                        None => {
+                            cells.push((child_page, median_key));
+                            rc = new_page;
+                        }
+                    }
 
                     // Promote cells[mid] as the separator key to the parent.
                     let mid = cells.len() / 2;
@@ -820,6 +828,34 @@ mod tests {
             if *k != 3 {
                 assert_eq!(v.as_slice(), b"0123456789");
             }
+        }
+    }
+
+    #[test]
+    fn test_btree_sequential_inserts_split_full_interior_page() {
+        // ~1000-byte rows: a few per leaf, so the interior root fills up and has to
+        // split while the insert is going down its right-most child.
+        let mut store = MemStore::new();
+        let mut root = make_root(&mut store);
+        let val = vec![b'v'; 1000];
+        let n = 3000u64;
+        for i in 1..=n {
+            root = insert(&mut store, root, i, &val).unwrap();
+        }
+        let page = store.read_page(root).unwrap();
+        let (first, _) = read_internal_cell(&page, cell_ptr(&page, 0) as usize);
+        assert!(
+            !is_leaf(&store.read_page(first).unwrap()),
+            "expected two interior levels"
+        );
+        let keys: Vec<u64> = scan_all(&mut store, root)
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(keys, (1..=n).collect::<Vec<_>>());
+        for i in [1, n / 2, n] {
+            assert_eq!(search(&mut store, root, i).unwrap(), Some(val.clone()));
         }
     }
 
