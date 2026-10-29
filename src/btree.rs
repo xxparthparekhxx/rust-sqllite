@@ -208,7 +208,7 @@ pub fn search(store: &mut dyn PageStore, root_page: u32, key: u64) -> io::Result
         for i in 0..n {
             let off = cell_ptr(&page, i) as usize;
             let (child, k) = read_internal_cell(&page, off);
-            if key < k {
+            if key <= k {
                 return search(store, child, key);
             }
         }
@@ -322,7 +322,8 @@ fn insert_recursive(
             cells.sort_by(|a, b| a.0.cmp(&b.0));
 
             let mid = cells.len() / 2;
-            let median_key = cells[mid].0;
+            // SQLite separator key convention: max key of the left subtree.
+            let median_key = cells[mid - 1].0;
 
             let left_cells = &cells[..mid];
             let right_cells = &cells[mid..];
@@ -352,7 +353,7 @@ fn insert_recursive(
         for i in 0..n {
             let off = cell_ptr(&page, i) as usize;
             let (child, k) = read_internal_cell(&page, off);
-            if key < k {
+            if key <= k {
                 child_page = child;
                 child_idx = Some(i);
                 break;
@@ -389,27 +390,17 @@ fn insert_recursive(
                             insert_internal_cell(&mut page, old_right, median_key);
                             set_right_child(&mut page, new_page);
                         }
-                        Some(_i) => {
-                            // Collect all cells, insert the new one, sort, rebuild.
+                        Some(child_idx) => {
+                            // The cell at child_idx references child_page with an old separator key.
+                            // The child page split into child_page (keys < median_key) and new_page
+                            // (keys >= median_key). We must:
+                            //   1. Replace (child_page, old_key) with (child_page, median_key)
+                            //   2. Insert (new_page, old_key) right after it.
                             let mut cells = collect_internal_cells(&page);
                             let rc = right_child(&page);
-                            cells.push((child_page, median_key));
-
-                            // Fix children: the left part keeps child_page, right part is new_page.
-                            // After inserting (child_page, median_key), the cell at old position i
-                            // should now have left_child = new_page.
-                            cells.sort_by(|a, b| a.1.cmp(&b.1));
-
-                            // Fix: find the cell AFTER median_key and set its left_child to new_page.
-                            for j in 0..cells.len() {
-                                if cells[j].1 == median_key {
-                                    if j + 1 < cells.len() {
-                                        cells[j + 1].0 = new_page;
-                                    }
-                                    break;
-                                }
-                            }
-
+                            let old_key = cells[child_idx as usize].1;
+                            cells[child_idx as usize] = (child_page, median_key);
+                            cells.insert(child_idx as usize + 1, (new_page, old_key));
                             rebuild_internal_page(&mut page, &cells, rc);
                         }
                     }
@@ -420,24 +411,23 @@ fn insert_recursive(
                     let mut cells = collect_internal_cells(&page);
                     let rc = right_child(&page);
 
-                    cells.push((child_page, median_key));
-                    cells.sort_by(|a, b| a.1.cmp(&b.1));
+                    // Find the cell referencing child_page, replace its separator key with
+                    // median_key (max key of the now-smaller child_page), and insert
+                    // (new_page, old_key) right after it (old_key = max key of new_page).
+                    let child_idx = cells
+                        .iter()
+                        .position(|(cp, _)| *cp == child_page)
+                        .expect("child_page must be referenced by a cell");
+                    let old_key = cells[child_idx].1;
+                    cells[child_idx] = (child_page, median_key);
+                    cells.insert(child_idx + 1, (new_page, old_key));
 
-                    // Fix child pointer for median.
-                    for j in 0..cells.len() {
-                        if cells[j].1 == median_key {
-                            if j + 1 < cells.len() {
-                                cells[j + 1].0 = new_page;
-                            }
-                            break;
-                        }
-                    }
-
+                    // Promote cells[mid] as the separator key to the parent.
                     let mid = cells.len() / 2;
                     let promote_key = cells[mid].1;
 
                     let left_cells = &cells[..mid];
-                    // The left child of the promoted key's cell becomes the right_child of the left page.
+                    // The left child of the promoted key's cell is the right_child of the left page.
                     let left_rc = cells[mid].0;
                     let right_cells = &cells[mid + 1..];
                     let right_rc = rc;
@@ -479,7 +469,7 @@ pub fn delete(store: &mut dyn PageStore, root_page: u32, key: u64) -> io::Result
         for i in 0..n {
             let off = cell_ptr(&page, i) as usize;
             let (child, k) = read_internal_cell(&page, off);
-            if key < k {
+            if key <= k {
                 return delete(store, child, key);
             }
         }
