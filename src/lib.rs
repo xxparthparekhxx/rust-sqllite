@@ -32,6 +32,7 @@
 
 pub mod btree;
 pub mod engine;
+pub mod index;
 pub mod pager;
 pub mod schema;
 pub mod sql;

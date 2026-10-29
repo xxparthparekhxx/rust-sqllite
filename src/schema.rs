@@ -1,4 +1,5 @@
 use crate::varint::{get_varint, put_varint};
+use std::cmp::Ordering;
 use std::fmt;
 use std::io;
 
@@ -58,6 +59,67 @@ pub struct Table {
     pub root_page: u32,
     /// The original CREATE TABLE SQL statement.
     pub sql: String,
+}
+
+/// The record SQLite stores in a single-column index on a rowid table:
+/// (column value, rowid).
+pub fn index_record(value: &Value, rowid: i64) -> Vec<u8> {
+    serialize_row(&[value.clone(), Value::Integer(rowid)])
+}
+
+/// Order two values the way SQLite orders index records under the BINARY
+/// collation: NULL < INTEGER and REAL (compared by numeric value) < TEXT < BLOB.
+/// TEXT and BLOB compare bytewise (memcmp), then by length.
+pub fn compare_values(a: &Value, b: &Value) -> Ordering {
+    fn class(v: &Value) -> u8 {
+        match v {
+            Value::Null => 0,
+            Value::Integer(_) | Value::Real(_) => 1,
+            Value::Text(_) => 2,
+            Value::Blob(_) => 3,
+        }
+    }
+    match (a, b) {
+        (Value::Null, Value::Null) => Ordering::Equal,
+        (Value::Integer(x), Value::Integer(y)) => x.cmp(y),
+        (Value::Real(x), Value::Real(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
+        (Value::Integer(i), Value::Real(r)) => int_float_cmp(*i, *r),
+        (Value::Real(r), Value::Integer(i)) => int_float_cmp(*i, *r).reverse(),
+        (Value::Text(x), Value::Text(y)) => x.as_bytes().cmp(y.as_bytes()),
+        (Value::Blob(x), Value::Blob(y)) => x.cmp(y),
+        _ => class(a).cmp(&class(b)),
+    }
+}
+
+/// sqlite3IntFloatCompare: exact comparison of an i64 against an f64.
+fn int_float_cmp(i: i64, r: f64) -> Ordering {
+    if r.is_nan() {
+        // SQLite treats NaN as NULL, and every number sorts after NULL.
+        return Ordering::Greater;
+    }
+    if r < -9223372036854775808.0 {
+        return Ordering::Greater;
+    }
+    if r >= 9223372036854775808.0 {
+        return Ordering::Less;
+    }
+    let y = r as i64;
+    match i.cmp(&y) {
+        Ordering::Equal => (i as f64).partial_cmp(&r).unwrap_or(Ordering::Equal),
+        other => other,
+    }
+}
+
+/// Compare two decoded records field by field, as sqlite3VdbeRecordCompare does.
+/// When one record is a prefix of the other, the shorter sorts first.
+pub fn compare_records(a: &[Value], b: &[Value]) -> Ordering {
+    for (x, y) in a.iter().zip(b) {
+        let c = compare_values(x, y);
+        if c != Ordering::Equal {
+            return c;
+        }
+    }
+    a.len().cmp(&b.len())
 }
 
 /// A runtime value.
@@ -521,6 +583,57 @@ mod tests {
         assert_eq!(t.columns.len(), t2.columns.len());
         assert_eq!(t.columns[0].name, t2.columns[0].name);
         assert_eq!(t.columns[1].data_type, t2.columns[1].data_type);
+    }
+
+    #[test]
+    fn test_compare_values_sqlite_order() {
+        use Value::*;
+        // Type classes: NULL < numbers < text < blob.
+        let ordered = [
+            Null,
+            Integer(i64::MIN),
+            Real(-1.5),
+            Integer(-1),
+            Integer(0),
+            Real(0.5),
+            Integer(1),
+            Real(1e300),
+            Text(String::new()),
+            Text("A".to_string()),
+            Text("a".to_string()),
+            Text("ab".to_string()),
+            Text("b".to_string()),
+            Blob(vec![]),
+            Blob(vec![0]),
+            Blob(vec![0, 0]),
+            Blob(vec![1]),
+        ];
+        for (i, a) in ordered.iter().enumerate() {
+            for (j, b) in ordered.iter().enumerate() {
+                assert_eq!(compare_values(a, b), i.cmp(&j), "{:?} vs {:?}", a, b);
+            }
+        }
+        // Integers and reals compare by value.
+        assert_eq!(compare_values(&Integer(5), &Real(5.0)), Ordering::Equal);
+        assert_eq!(compare_values(&Real(5.0), &Integer(5)), Ordering::Equal);
+        assert_eq!(
+            compare_values(&Integer(i64::MAX), &Real(9.3e18)),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_values(&Integer(9007199254740993), &Real(9007199254740992.0)),
+            Ordering::Greater
+        );
+        // Text compares by bytes, not by numeric value.
+        assert_eq!(
+            compare_values(&Text("10".into()), &Text("9".into())),
+            Ordering::Less
+        );
+        // Two NULLs are equal in a record comparison.
+        assert_eq!(
+            compare_records(&[Null, Integer(1)], &[Null, Integer(2)]),
+            Ordering::Less
+        );
     }
 
     #[test]
