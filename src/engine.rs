@@ -3,8 +3,12 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::btree::{self, PageStore, init_leaf_page};
+use crate::index;
 use crate::pager::{FileHeader, PAGE_SIZE, Pager};
-use crate::schema::{Column, Row, Table, Value, deserialize_row, serialize_row};
+use crate::schema::{
+    Column, Index, Row, Table, Value, autoindex_columns, autoindex_name, compare_values,
+    deserialize_row, index_record, serialize_row,
+};
 use crate::sql::{BinOp, ColumnDef, Expr, Parser, SelectColumn, Statement};
 use crate::wal::Wal;
 
@@ -67,6 +71,29 @@ fn current_timestamp() -> String {
         "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
         year, month, day, hours, minutes, seconds
     )
+}
+
+/// Build a catalog column from its parsed definition.
+fn column_from_def(cd: &ColumnDef) -> Column {
+    // Extract default value text from the parsed Expr.
+    let default_text = cd.default_value.as_ref().and_then(|expr| match expr {
+        Expr::Literal(Value::Text(s)) => Some(s.clone()),
+        Expr::Literal(Value::Integer(i)) => Some(i.to_string()),
+        Expr::Literal(Value::Real(r)) => Some(r.to_string()),
+        Expr::Literal(Value::Null) => Some("NULL".to_string()),
+        Expr::ColumnRef(name) => Some(name.clone()), // e.g. CURRENT_TIMESTAMP
+        _ => None,
+    });
+    Column {
+        name: cd.name.clone(),
+        data_type: cd.data_type.clone(),
+        is_primary_key: cd.is_primary_key,
+        is_autoincrement: cd.is_autoincrement,
+        is_not_null: cd.is_not_null,
+        is_unique: cd.is_unique,
+        is_rowid_alias: cd.is_rowid_alias,
+        default_text,
+    }
 }
 
 /// The catalog B-Tree lives on page 1 (page 0 is the file header).
@@ -196,6 +223,11 @@ impl<'a> PageStore for WalPageStore<'a> {
 /// writes at most usable/4 - 8 so that older readers stay compatible.
 const FREELIST_TRUNK_MAX_LEAVES: u32 = (PAGE_SIZE / 4 - 8) as u32;
 
+/// True if `row[i]` is the text `s`.
+fn text_at(row: &[Value], i: usize, s: &str) -> bool {
+    matches!(row.get(i), Some(Value::Text(t)) if t == s)
+}
+
 fn read_be_u32(buf: &[u8], off: usize) -> u32 {
     u32::from_be_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
 }
@@ -221,7 +253,8 @@ pub struct Engine {
     schema_cache: HashMap<String, Table>,
     /// Whether we are in an explicit transaction.
     in_transaction: bool,
-    /// Dirty pages accumulated during an explicit transaction.
+    /// Pages written but not yet committed: by the open explicit transaction, or by
+    /// the statement being executed. Reads see these before the WAL and the file.
     txn_dirty_pages: Vec<(u32, [u8; PAGE_SIZE])>,
     /// File header (freelist fields included) as of BEGIN, restored on ROLLBACK.
     txn_header: FileHeader,
@@ -292,13 +325,13 @@ impl Engine {
             Statement::CreateTable {
                 table_name,
                 columns,
-            } => self.exec_create_table(&table_name, &columns, original_sql),
-            Statement::DropTable { table_name } => self.exec_drop_table(&table_name),
+            } => self.atomic(|e| e.exec_create_table(&table_name, &columns, original_sql)),
+            Statement::DropTable { table_name } => self.atomic(|e| e.exec_drop_table(&table_name)),
             Statement::Insert {
                 table_name,
                 columns,
                 values,
-            } => self.exec_insert(&table_name, columns.as_deref(), &values),
+            } => self.atomic(|e| e.exec_insert(&table_name, columns.as_deref(), &values)),
             Statement::Select {
                 columns,
                 table_name,
@@ -308,11 +341,11 @@ impl Engine {
                 table_name,
                 assignments,
                 where_clause,
-            } => self.exec_update(&table_name, &assignments, where_clause.as_ref()),
+            } => self.atomic(|e| e.exec_update(&table_name, &assignments, where_clause.as_ref())),
             Statement::Delete {
                 table_name,
                 where_clause,
-            } => self.exec_delete(&table_name, where_clause.as_ref()),
+            } => self.atomic(|e| e.exec_delete(&table_name, where_clause.as_ref())),
             Statement::Begin => {
                 if self.in_transaction {
                     // The pending writes are dropped below; drop their header
@@ -329,18 +362,65 @@ impl Engine {
         }
     }
 
+    // ─────────── Statement execution helpers ───────────
+
+    /// Page access that sees every write not yet committed. Writes are added to
+    /// `txn_dirty_pages`, which `atomic` commits when the statement succeeds (or
+    /// which COMMIT flushes inside an explicit transaction).
+    fn store(&mut self) -> WalPageStore<'_> {
+        WalPageStore {
+            pager: &mut self.pager,
+            wal: &mut self.wal,
+            dirty_pages: &mut self.txn_dirty_pages,
+        }
+    }
+
+    /// Run a writing statement atomically. Its page writes are only committed (or
+    /// kept in the open transaction) if it succeeds; on error, every page it wrote,
+    /// the file header and the cached schema are put back as they were, so a failed
+    /// constraint check partway through a multi-row statement changes nothing.
+    fn atomic<F>(&mut self, f: F) -> io::Result<QueryResult>
+    where
+        F: FnOnce(&mut Self) -> io::Result<QueryResult>,
+    {
+        let implicit = !self.in_transaction;
+        let mark = self.txn_dirty_pages.len();
+        let header = self.pager.header;
+        let schema = self.schema_cache.clone();
+        let next_rowid = self.next_rowid.clone();
+        let next_catalog_rowid = self.next_catalog_rowid;
+
+        self.in_transaction = true;
+        let result = f(self);
+        if implicit {
+            self.in_transaction = false;
+        }
+        match result {
+            Ok(r) => {
+                if implicit {
+                    let dirty = std::mem::take(&mut self.txn_dirty_pages);
+                    self.commit_dirty_pages(dirty)?;
+                }
+                Ok(r)
+            }
+            Err(e) => {
+                self.txn_dirty_pages.truncate(mark);
+                self.pager.header = header;
+                self.schema_cache = schema;
+                self.next_rowid = next_rowid;
+                self.next_catalog_rowid = next_catalog_rowid;
+                Err(e)
+            }
+        }
+    }
+
     // ─────────── Catalog management ───────────
 
     fn load_catalog(&mut self) -> io::Result<()> {
         self.schema_cache.clear();
-        let mut dirty = Vec::new();
-        let mut store = WalPageStore {
-            pager: &mut self.pager,
-            wal: &mut self.wal,
-            dirty_pages: &mut dirty,
-        };
-        let entries = crate::btree::scan_all(&mut store, CATALOG_ROOT_PAGE)?;
+        let entries = crate::btree::scan_all(&mut self.store(), CATALOG_ROOT_PAGE)?;
         let mut max_catalog_rowid = 0u64;
+        let mut index_roots: HashMap<String, u32> = HashMap::new();
         for (key, value) in entries {
             if key > max_catalog_rowid {
                 max_catalog_rowid = key;
@@ -354,9 +434,6 @@ impl Engine {
                 Value::Text(s) => s.clone(),
                 _ => continue,
             };
-            if entry_type != "table" {
-                continue; // only handle tables for now
-            }
             let name = match &row[1] {
                 Value::Text(s) => s.clone(),
                 _ => continue,
@@ -365,6 +442,13 @@ impl Engine {
                 Value::Integer(i) => *i as u32,
                 _ => continue,
             };
+            if entry_type == "index" {
+                index_roots.insert(name, root_page);
+                continue;
+            }
+            if entry_type != "table" {
+                continue;
+            }
             let sql_text = match &row[4] {
                 Value::Text(s) => s.clone(),
                 _ => continue,
@@ -376,85 +460,75 @@ impl Engine {
                     columns: col_defs, ..
                 } = stmt
                 {
-                    let columns: Vec<Column> = col_defs
-                        .iter()
-                        .map(|cd| {
-                            let default_text =
-                                cd.default_value.as_ref().and_then(|expr| match expr {
-                                    Expr::Literal(Value::Text(s)) => Some(s.clone()),
-                                    Expr::Literal(Value::Integer(i)) => Some(i.to_string()),
-                                    Expr::Literal(Value::Real(r)) => Some(r.to_string()),
-                                    Expr::Literal(Value::Null) => Some("NULL".to_string()),
-                                    Expr::ColumnRef(n) => Some(n.clone()),
-                                    _ => None,
-                                });
-                            Column {
-                                name: cd.name.clone(),
-                                data_type: cd.data_type.clone(),
-                                is_primary_key: cd.is_primary_key,
-                                is_autoincrement: cd.is_autoincrement,
-                                is_not_null: cd.is_not_null,
-                                is_unique: cd.is_unique,
-                                default_text,
-                            }
-                        })
-                        .collect();
+                    let columns: Vec<Column> = col_defs.iter().map(column_from_def).collect();
                     let table = Table {
                         name: name.clone(),
                         columns,
                         root_page,
                         sql: sql_text,
+                        indexes: Vec::new(),
                     };
                     self.schema_cache.insert(name, table);
                 }
             }
         }
+
+        // Attach each table's automatic indexes. Their columns follow from the
+        // CREATE TABLE text; their root pages come from the 'index' rows. A file
+        // written before autoindexes existed has none, and then UNIQUE falls back
+        // to a table scan.
+        for table in self.schema_cache.values_mut() {
+            table.indexes = autoindex_columns(&table.columns)
+                .into_iter()
+                .enumerate()
+                .filter_map(|(n, column)| {
+                    let name = autoindex_name(&table.name, n + 1);
+                    let root_page = *index_roots.get(&name)?;
+                    Some(Index {
+                        name,
+                        column,
+                        root_page,
+                    })
+                })
+                .collect();
+        }
+
         self.next_catalog_rowid = max_catalog_rowid + 1;
         Ok(())
     }
 
-    fn save_table_to_catalog(&mut self, table: &Table) -> io::Result<()> {
-        // First, delete any existing catalog entry for this table name.
-        {
-            let mut scan_dirty = Vec::new();
-            let entries = {
-                let mut store = WalPageStore {
-                    pager: &mut self.pager,
-                    wal: &mut self.wal,
-                    dirty_pages: &mut scan_dirty,
-                };
-                crate::btree::scan_all(&mut store, CATALOG_ROOT_PAGE)?
-            };
-            for (k, v) in entries {
-                if let Ok(row) = deserialize_row(&v) {
-                    if row.len() >= 2 {
-                        if let Value::Text(ref n) = row[1] {
-                            if n == &table.name {
-                                let mut del_dirty = if self.in_transaction {
-                                    std::mem::take(&mut self.txn_dirty_pages)
-                                } else {
-                                    Vec::new()
-                                };
-                                {
-                                    let mut store = WalPageStore {
-                                        pager: &mut self.pager,
-                                        wal: &mut self.wal,
-                                        dirty_pages: &mut del_dirty,
-                                    };
-                                    crate::btree::delete(&mut store, CATALOG_ROOT_PAGE, k)?;
-                                }
-                                if self.in_transaction {
-                                    self.txn_dirty_pages = del_dirty;
-                                } else {
-                                    self.commit_dirty_pages(del_dirty)?;
-                                }
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
+    /// Rowids of the sqlite_schema rows for which `pred` holds.
+    fn catalog_keys(&mut self, pred: impl Fn(&[Value]) -> bool) -> io::Result<Vec<u64>> {
+        let entries = crate::btree::scan_all(&mut self.store(), CATALOG_ROOT_PAGE)?;
+        Ok(entries
+            .into_iter()
+            .filter(|(_, v)| deserialize_row(v).map(|row| pred(&row)).unwrap_or(false))
+            .map(|(k, _)| k)
+            .collect())
+    }
+
+    /// Insert or overwrite the sqlite_schema row with rowid `key`.
+    fn write_catalog_row(&mut self, key: u64, row: &[Value]) -> io::Result<()> {
+        let value = serialize_row(row);
+        let new_root = crate::btree::insert(&mut self.store(), CATALOG_ROOT_PAGE, key, &value)?;
+        if new_root != CATALOG_ROOT_PAGE {
+            // sqlite_schema must stay rooted at page 1; a split would move it.
+            return Err(io::Error::other(
+                "sqlite_schema is full: page 1 cannot split",
+            ));
         }
+        Ok(())
+    }
+
+    fn save_table_to_catalog(&mut self, table: &Table) -> io::Result<()> {
+        // Overwrite the table's existing row in place, keeping its rowid. SQLite
+        // reads sqlite_schema in rowid order and reports an index row that comes
+        // before its table as an "orphan index".
+        let existing = self
+            .catalog_keys(|row| text_at(row, 0, "table") && text_at(row, 1, &table.name))?
+            .into_iter()
+            .next();
+        let key = existing.unwrap_or_else(|| self.next_catalog_key());
 
         // Build the sqlite_schema row: (type, name, tbl_name, rootpage, sql)
         let schema_row = vec![
@@ -464,30 +538,13 @@ impl Engine {
             Value::Integer(table.root_page as i64),
             Value::Text(table.sql.clone()),
         ];
-        let value = serialize_row(&schema_row);
+        self.write_catalog_row(key, &schema_row)
+    }
 
-        // Insert with a fresh key.
+    fn next_catalog_key(&mut self) -> u64 {
         let key = self.next_catalog_rowid;
         self.next_catalog_rowid += 1;
-        let mut dirty = if self.in_transaction {
-            std::mem::take(&mut self.txn_dirty_pages)
-        } else {
-            Vec::new()
-        };
-
-        let mut store = WalPageStore {
-            pager: &mut self.pager,
-            wal: &mut self.wal,
-            dirty_pages: &mut dirty,
-        };
-        let _new_root = crate::btree::insert(&mut store, CATALOG_ROOT_PAGE, key, &value)?;
-
-        if self.in_transaction {
-            self.txn_dirty_pages = dirty;
-        } else {
-            self.commit_dirty_pages(dirty)?;
-        }
-        Ok(())
+        key
     }
 
     fn commit_dirty_pages(&mut self, pages: Vec<(u32, [u8; PAGE_SIZE])>) -> io::Result<()> {
@@ -539,18 +596,8 @@ impl Engine {
         }
 
         // Allocate a root page for the new table.
-        let mut dirty = if self.in_transaction {
-            std::mem::take(&mut self.txn_dirty_pages)
-        } else {
-            Vec::new()
-        };
-
         let root_page = {
-            let mut store = WalPageStore {
-                pager: &mut self.pager,
-                wal: &mut self.wal,
-                dirty_pages: &mut dirty,
-            };
+            let mut store = self.store();
             let rp = store.allocate_page()?;
             let mut page = [0u8; PAGE_SIZE];
             init_leaf_page(&mut page);
@@ -558,44 +605,49 @@ impl Engine {
             rp
         };
 
-        if self.in_transaction {
-            self.txn_dirty_pages = dirty;
-        } else {
-            self.commit_dirty_pages(dirty)?;
-        }
+        let columns: Vec<Column> = col_defs.iter().map(column_from_def).collect();
 
-        let columns: Vec<Column> = col_defs
-            .iter()
-            .map(|cd| {
-                // Extract default value text from the parsed Expr.
-                let default_text = cd.default_value.as_ref().and_then(|expr| match expr {
-                    Expr::Literal(Value::Text(s)) => Some(s.clone()),
-                    Expr::Literal(Value::Integer(i)) => Some(i.to_string()),
-                    Expr::Literal(Value::Real(r)) => Some(r.to_string()),
-                    Expr::Literal(Value::Null) => Some("NULL".to_string()),
-                    Expr::ColumnRef(name) => Some(name.clone()), // e.g. CURRENT_TIMESTAMP
-                    _ => None,
-                });
-                Column {
-                    name: cd.name.clone(),
-                    data_type: cd.data_type.clone(),
-                    is_primary_key: cd.is_primary_key,
-                    is_autoincrement: cd.is_autoincrement,
-                    is_not_null: cd.is_not_null,
-                    is_unique: cd.is_unique,
-                    default_text,
-                }
-            })
-            .collect();
-
-        let table = Table {
+        let mut table = Table {
             name: table_name.to_string(),
             columns,
             root_page,
             sql: original_sql.trim().to_string(),
+            indexes: Vec::new(),
         };
 
         self.save_table_to_catalog(&table)?;
+
+        // SQLite keeps an automatic index for every UNIQUE column and for a PRIMARY
+        // KEY that is not the rowid alias. Each gets its own root page and a
+        // sqlite_schema row after the table's: ('index', name, table, root, NULL).
+        for (n, column) in autoindex_columns(&table.columns).into_iter().enumerate() {
+            let name = autoindex_name(table_name, n + 1);
+            let index_root = {
+                let mut store = self.store();
+                let rp = store.allocate_page()?;
+                let mut page = [0u8; PAGE_SIZE];
+                index::init_root_page(&mut page);
+                store.write_page(rp, page)?;
+                rp
+            };
+            let key = self.next_catalog_key();
+            self.write_catalog_row(
+                key,
+                &[
+                    Value::Text("index".to_string()),
+                    Value::Text(name.clone()),
+                    Value::Text(table_name.to_string()),
+                    Value::Integer(index_root as i64),
+                    Value::Null,
+                ],
+            )?;
+            table.indexes.push(Index {
+                name,
+                column,
+                root_page: index_root,
+            });
+        }
+
         self.schema_cache.insert(table_name.to_string(), table);
         self.next_rowid.insert(table_name.to_string(), 1);
 
@@ -605,57 +657,34 @@ impl Engine {
     // ─────────── DROP TABLE ───────────
 
     fn exec_drop_table(&mut self, table_name: &str) -> io::Result<QueryResult> {
-        if !self.schema_cache.contains_key(table_name) {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("table '{}' does not exist", table_name),
-            ));
+        let table = self
+            .schema_cache
+            .get(table_name)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("table '{}' does not exist", table_name),
+                )
+            })?
+            .clone();
+
+        // Remove the table's sqlite_schema row and the rows of its indexes.
+        let keys = self.catalog_keys(|row| {
+            (text_at(row, 0, "table") && text_at(row, 1, table_name))
+                || (text_at(row, 0, "index") && text_at(row, 2, table_name))
+        })?;
+        for key in keys {
+            crate::btree::delete(&mut self.store(), CATALOG_ROOT_PAGE, key)?;
         }
 
-        // Remove from catalog B-Tree.
-        let mut key_to_delete = None;
-        let mut dirty_scan = Vec::new();
-        {
-            let mut store = WalPageStore {
-                pager: &mut self.pager,
-                wal: &mut self.wal,
-                dirty_pages: &mut dirty_scan,
-            };
-            if let Ok(entries) = crate::btree::scan_all(&mut store, CATALOG_ROOT_PAGE) {
-                for (k, v) in entries {
-                    if let Ok(row) = deserialize_row(&v) {
-                        if row.len() >= 2 {
-                            if let Value::Text(ref n) = row[1] {
-                                if n == table_name {
-                                    key_to_delete = Some(k);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+        // Put the table's and its indexes' pages on the freelist, so the file has
+        // no pages that nothing references.
+        let mut pages = crate::btree::collect_pages(&mut self.store(), table.root_page)?;
+        for idx in &table.indexes {
+            pages.extend(index::collect_pages(&mut self.store(), idx.root_page)?);
         }
-
-        if let Some(key) = key_to_delete {
-            let mut dirty = if self.in_transaction {
-                std::mem::take(&mut self.txn_dirty_pages)
-            } else {
-                Vec::new()
-            };
-            {
-                let mut store = WalPageStore {
-                    pager: &mut self.pager,
-                    wal: &mut self.wal,
-                    dirty_pages: &mut dirty,
-                };
-                crate::btree::delete(&mut store, CATALOG_ROOT_PAGE, key)?;
-            }
-            if self.in_transaction {
-                self.txn_dirty_pages = dirty;
-            } else {
-                self.commit_dirty_pages(dirty)?;
-            }
+        for page in pages {
+            self.store().free_page(page)?;
         }
 
         self.schema_cache.remove(table_name);
@@ -797,71 +826,26 @@ impl Engine {
                 }
             }
 
-            // UNIQUE: no two rows may have the same non-NULL value in a UNIQUE column.
-            for (idx, col) in table.columns.iter().enumerate() {
-                if !col.is_unique {
-                    continue;
+            // An INSERT that reuses an existing rowid overwrites that row (as this
+            // engine always has); its old index entries must then go.
+            let old_row = if table.indexes.is_empty() {
+                None
+            } else {
+                let root = self.table_root(table_name);
+                match crate::btree::search(&mut self.store(), root, key)? {
+                    Some(v) => Some(deserialize_row(&v)?),
+                    None => None,
                 }
-                let candidate = &row_values[idx];
-                if *candidate == Value::Null {
-                    // NULLs are distinct — multiple NULLs are allowed.
-                    continue;
-                }
-                let root_page = table.root_page;
-                let mut dummy_dirty = Vec::new();
-                let mut store = WalPageStore {
-                    pager: &mut self.pager,
-                    wal: &mut self.wal,
-                    dirty_pages: &mut dummy_dirty,
-                };
-                let entries = crate::btree::scan_all(&mut store, root_page)?;
-                for (_existing_key, value) in &entries {
-                    let existing_row = match deserialize_row(value) {
-                        Ok(r) => r,
-                        Err(_) => continue,
-                    };
-                    if existing_row.get(idx) == Some(candidate) {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            format!(
-                                "UNIQUE constraint failed: {}.{}",
-                                table_name, col.name
-                            ),
-                        ));
-                    }
-                }
-            }
+            };
+
+            // UNIQUE and non-rowid PRIMARY KEY columns, checked through their indexes.
+            // Any existing holder of the value conflicts, even the row being
+            // overwritten: an INSERT must not pass off a duplicate key as a rewrite.
+            self.check_unique(&table, &row_values, rowid, None)?;
 
             let value = serialize_row(&row_values);
-
-            let root_page = table.root_page;
-            let mut dirty = if self.in_transaction {
-                std::mem::take(&mut self.txn_dirty_pages)
-            } else {
-                Vec::new()
-            };
-            let new_root = {
-                let mut store = WalPageStore {
-                    pager: &mut self.pager,
-                    wal: &mut self.wal,
-                    dirty_pages: &mut dirty,
-                };
-                crate::btree::insert(&mut store, root_page, key, &value)?
-            };
-
-            if new_root != root_page {
-                // Root page changed due to split — update catalog.
-                if self.in_transaction {
-                    self.txn_dirty_pages = dirty;
-                } else {
-                    self.commit_dirty_pages(dirty)?;
-                }
-                self.update_table_root(table_name, new_root)?;
-            } else if self.in_transaction {
-                self.txn_dirty_pages = dirty;
-            } else {
-                self.commit_dirty_pages(dirty)?;
-            }
+            self.write_row(table_name, key, &value)?;
+            self.update_indexes(&table, rowid, old_row.as_deref(), &row_values)?;
 
             count += 1;
         }
@@ -885,13 +869,7 @@ impl Engine {
             // Note: in a real implementation we'd just traverse down the rightmost children
             // of the B-Tree to find the max key in O(log N) rather than sweeping, but since
             // `scan_all` exists, we'll use it for simplicity here.
-            let mut dummy_dirty = Vec::new();
-            let mut store = WalPageStore {
-                pager: &mut self.pager,
-                wal: &mut self.wal,
-                dirty_pages: &mut dummy_dirty,
-            };
-            if let Ok(entries) = crate::btree::scan_all(&mut store, root_page) {
+            if let Ok(entries) = crate::btree::scan_all(&mut self.store(), root_page) {
                 for (k, _) in entries {
                     let id = k as i64;
                     if id > max_id {
@@ -915,6 +893,115 @@ impl Engine {
         Ok(())
     }
 
+    /// The table's current root page. It can move when the root splits, so a
+    /// statement must not keep using the one it started with.
+    fn table_root(&self, table_name: &str) -> u32 {
+        self.schema_cache
+            .get(table_name)
+            .map(|t| t.root_page)
+            .unwrap_or(0)
+    }
+
+    /// Store a table row under `key`, following the root if it moves.
+    fn write_row(&mut self, table_name: &str, key: u64, value: &[u8]) -> io::Result<()> {
+        let root = self.table_root(table_name);
+        let new_root = crate::btree::insert(&mut self.store(), root, key, value)?;
+        if new_root != root {
+            // Root page changed due to split — update catalog.
+            self.update_table_root(table_name, new_root)?;
+        }
+        Ok(())
+    }
+
+    /// Fail if writing `row` as `rowid` would give a UNIQUE (or non-rowid PRIMARY
+    /// KEY) column a value another row already holds. For an UPDATE, `old` is the
+    /// row's current contents: unchanged values are skipped and the row's own
+    /// index entry is not a conflict. For an INSERT (`old` is None) every existing
+    /// holder conflicts. NULLs never conflict.
+    fn check_unique(
+        &mut self,
+        table: &Table,
+        row: &[Value],
+        rowid: i64,
+        old: Option<&[Value]>,
+    ) -> io::Result<()> {
+        for column in autoindex_columns(&table.columns) {
+            let value = &row[column];
+            if *value == Value::Null || old.is_some_and(|o| o[column] == *value) {
+                continue;
+            }
+            let holder = match table.indexes.iter().find(|i| i.column == column) {
+                Some(idx) => index::find_rowid(&mut self.store(), idx.root_page, value)?,
+                // A file written before autoindexes existed: scan the table.
+                None => {
+                    let root = self.table_root(&table.name);
+                    let mut found = None;
+                    for (k, v) in crate::btree::scan_all(&mut self.store(), root)? {
+                        let existing = deserialize_row(&v)?;
+                        if existing
+                            .get(column)
+                            .is_some_and(|e| compare_values(e, value) == std::cmp::Ordering::Equal)
+                        {
+                            found = Some(k as i64);
+                            break;
+                        }
+                    }
+                    found
+                }
+            };
+            if holder.is_some_and(|h| old.is_none() || h != rowid) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "UNIQUE constraint failed: {}.{}",
+                        table.name, table.columns[column].name
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Bring the automatic indexes in line after row `rowid` changed from `old`
+    /// (None for a new row) to `new`.
+    fn update_indexes(
+        &mut self,
+        table: &Table,
+        rowid: i64,
+        old: Option<&[Value]>,
+        new: &[Value],
+    ) -> io::Result<()> {
+        for idx in &table.indexes {
+            let value = &new[idx.column];
+            if let Some(old) = old {
+                if old[idx.column] == *value {
+                    continue;
+                }
+                self.index_delete(idx, &old[idx.column], rowid)?;
+            }
+            index::insert(
+                &mut self.store(),
+                idx.root_page,
+                &index_record(value, rowid),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn index_delete(&mut self, idx: &Index, value: &Value, rowid: i64) -> io::Result<()> {
+        if !index::delete(
+            &mut self.store(),
+            idx.root_page,
+            &index_record(value, rowid),
+        )? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("index {} has no entry for rowid {}", idx.name, rowid),
+            ));
+        }
+        Ok(())
+    }
+
     // ─────────── SELECT ───────────
 
     fn exec_select(
@@ -934,17 +1021,9 @@ impl Engine {
             })?
             .clone();
 
-        // Scan all rows.
+        // Scan all rows, including writes of the open transaction.
         let root = table.root_page;
-        let mut dirty = Vec::new();
-        let all_kv = {
-            let mut store = WalPageStore {
-                pager: &mut self.pager,
-                wal: &mut self.wal,
-                dirty_pages: &mut dirty,
-            };
-            crate::btree::scan_all(&mut store, root)?
-        };
+        let all_kv = crate::btree::scan_all(&mut self.store(), root)?;
 
         // Determine output columns.
         let output_col_names: Vec<String> = match &select_cols[0] {
@@ -1012,22 +1091,14 @@ impl Engine {
             })?
             .clone();
 
-        let root = table.root_page;
-        let mut dirty_scan = Vec::new();
-        let all_kv = {
-            let mut store = WalPageStore {
-                pager: &mut self.pager,
-                wal: &mut self.wal,
-                dirty_pages: &mut dirty_scan,
-            };
-            btree::scan_all(&mut store, root)?
-        };
+        let all_kv = btree::scan_all(&mut self.store(), table.root_page)?;
 
         let mut count = 0u64;
-        let mut updates: Vec<(u64, Vec<u8>)> = Vec::new();
+        let mut updates: Vec<(u64, Row, Row)> = Vec::new();
 
         for (key, value) in &all_kv {
-            let mut row = deserialize_row(value)?;
+            let old_row = deserialize_row(value)?;
+            let mut row = old_row.clone();
             if let Some(wc) = where_clause {
                 if !self.eval_where(wc, &row, &table)? {
                     continue;
@@ -1047,42 +1118,18 @@ impl Engine {
                     })?;
                 row[idx] = self.eval_expr_with_row(expr, &row, &table)?;
             }
-            updates.push((*key, serialize_row(&row)));
+            updates.push((*key, old_row, row));
             count += 1;
         }
 
-        // Write updated rows.
-        for (key, new_value) in updates {
-            let root = self
-                .schema_cache
-                .get(table_name)
-                .map(|t| t.root_page)
-                .unwrap_or(root);
-            let mut dirty = if self.in_transaction {
-                std::mem::take(&mut self.txn_dirty_pages)
-            } else {
-                Vec::new()
-            };
-            let new_root = {
-                let mut store = WalPageStore {
-                    pager: &mut self.pager,
-                    wal: &mut self.wal,
-                    dirty_pages: &mut dirty,
-                };
-                crate::btree::insert(&mut store, root, key, &new_value)?
-            };
-            if new_root != root {
-                if self.in_transaction {
-                    self.txn_dirty_pages = dirty;
-                } else {
-                    self.commit_dirty_pages(dirty)?;
-                }
-                self.update_table_root(table_name, new_root)?;
-            } else if self.in_transaction {
-                self.txn_dirty_pages = dirty;
-            } else {
-                self.commit_dirty_pages(dirty)?;
-            }
+        // Write updated rows one at a time, as SQLite does: each row's new values are
+        // checked against the index as left by the rows before it. A conflict fails
+        // the whole statement (see `atomic`).
+        for (key, old_row, new_row) in updates {
+            let rowid = key as i64;
+            self.check_unique(&table, &new_row, rowid, Some(&old_row))?;
+            self.write_row(table_name, key, &serialize_row(&new_row))?;
+            self.update_indexes(&table, rowid, Some(&old_row), &new_row)?;
         }
 
         Ok(QueryResult::with_affected(count))
@@ -1106,18 +1153,9 @@ impl Engine {
             })?
             .clone();
 
-        let root = table.root_page;
-        let mut dirty_scan = Vec::new();
-        let all_kv = {
-            let mut store = WalPageStore {
-                pager: &mut self.pager,
-                wal: &mut self.wal,
-                dirty_pages: &mut dirty_scan,
-            };
-            btree::scan_all(&mut store, root)?
-        };
+        let all_kv = btree::scan_all(&mut self.store(), table.root_page)?;
 
-        let mut keys_to_delete: Vec<u64> = Vec::new();
+        let mut rows_to_delete: Vec<(u64, Row)> = Vec::new();
         for (key, value) in &all_kv {
             let row = deserialize_row(value)?;
             let should_delete = if let Some(wc) = where_clause {
@@ -1126,35 +1164,17 @@ impl Engine {
                 true
             };
             if should_delete {
-                keys_to_delete.push(*key);
+                rows_to_delete.push((*key, row));
             }
         }
 
-        let count = keys_to_delete.len() as u64;
+        let count = rows_to_delete.len() as u64;
 
-        for key in keys_to_delete {
-            let root = self
-                .schema_cache
-                .get(table_name)
-                .map(|t| t.root_page)
-                .unwrap_or(root);
-            let mut dirty = if self.in_transaction {
-                std::mem::take(&mut self.txn_dirty_pages)
-            } else {
-                Vec::new()
-            };
-            {
-                let mut store = WalPageStore {
-                    pager: &mut self.pager,
-                    wal: &mut self.wal,
-                    dirty_pages: &mut dirty,
-                };
-                crate::btree::delete(&mut store, root, key)?;
-            }
-            if self.in_transaction {
-                self.txn_dirty_pages = dirty;
-            } else {
-                self.commit_dirty_pages(dirty)?;
+        for (key, row) in rows_to_delete {
+            let root = self.table_root(table_name);
+            crate::btree::delete(&mut self.store(), root, key)?;
+            for idx in &table.indexes {
+                self.index_delete(idx, &row[idx.column], key as i64)?;
             }
         }
 

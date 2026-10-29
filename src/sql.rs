@@ -310,6 +310,8 @@ pub struct ColumnDef {
     pub is_not_null: bool,
     pub is_unique: bool,
     pub is_autoincrement: bool,
+    /// Declared exactly `INTEGER PRIMARY KEY`: SQLite's rowid alias.
+    pub is_rowid_alias: bool,
     pub default_value: Option<Expr>,
 }
 
@@ -467,6 +469,7 @@ impl Parser {
                     is_not_null: false,
                     is_unique: false,
                     is_autoincrement: false,
+                    is_rowid_alias: false,
                     default_value: None,
                 });
             }
@@ -482,6 +485,7 @@ impl Parser {
                         is_not_null: false,
                         is_unique: false,
                         is_autoincrement: false,
+                        is_rowid_alias: false,
                         default_value: None,
                     });
                 }
@@ -491,8 +495,13 @@ impl Parser {
         let data_type =
             DataType::from_str(&type_name).ok_or_else(|| format!("unknown type: {}", type_name))?;
 
+        // SQLite only treats a PRIMARY KEY as the rowid alias when the declared type
+        // is exactly "INTEGER" (any case, no size arguments).
+        let mut type_is_integer = type_name.eq_ignore_ascii_case("INTEGER");
+
         // Handle parameterized types like VARCHAR(50), DECIMAL(10,2), CHAR(1)
         if self.peek() == &Token::LParen {
+            type_is_integer = false;
             self.advance(); // skip '('
             // Consume everything until matching ')'
             let mut depth = 1;
@@ -582,6 +591,7 @@ impl Parser {
             is_not_null,
             is_unique,
             is_autoincrement,
+            is_rowid_alias: is_primary_key && type_is_integer,
             default_value,
         })
     }
@@ -873,7 +883,22 @@ mod tests {
                 assert_eq!(table_name, "users");
                 assert_eq!(columns.len(), 3);
                 assert!(columns[0].is_primary_key);
+                assert!(columns[0].is_rowid_alias);
+                assert!(!columns[2].is_rowid_alias);
                 assert_eq!(columns[1].data_type, DataType::Text);
+            }
+            _ => panic!("expected CreateTable"),
+        }
+    }
+
+    #[test]
+    fn test_parser_rowid_alias_needs_exact_integer() {
+        let sql = "CREATE TABLE t (a integer primary key, b INT PRIMARY KEY, \
+                   c INTEGER(10) PRIMARY KEY, d INTEGER UNIQUE);";
+        match Parser::parse(sql).unwrap() {
+            Statement::CreateTable { columns, .. } => {
+                let alias: Vec<bool> = columns.iter().map(|c| c.is_rowid_alias).collect();
+                assert_eq!(alias, vec![true, false, false, false]);
             }
             _ => panic!("expected CreateTable"),
         }

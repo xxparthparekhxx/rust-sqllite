@@ -46,6 +46,9 @@ pub struct Column {
     pub is_autoincrement: bool,
     pub is_not_null: bool,
     pub is_unique: bool,
+    /// Declared exactly `INTEGER PRIMARY KEY`, which SQLite treats as an alias for
+    /// the rowid (no automatic index). `INT PRIMARY KEY` and friends are not.
+    pub is_rowid_alias: bool,
     /// Default value as a string literal (if any).
     pub default_text: Option<String>,
 }
@@ -59,6 +62,36 @@ pub struct Table {
     pub root_page: u32,
     /// The original CREATE TABLE SQL statement.
     pub sql: String,
+    /// Automatic indexes for UNIQUE and non-INTEGER PRIMARY KEY columns.
+    pub indexes: Vec<Index>,
+}
+
+/// An automatic index (`sqlite_autoindex_<table>_<n>`) that SQLite expects for a
+/// UNIQUE column or a PRIMARY KEY that is not the rowid alias.
+#[derive(Debug, Clone)]
+pub struct Index {
+    pub name: String,
+    /// Position of the indexed column in the table.
+    pub column: usize,
+    /// Root page of the index B-tree. It never moves.
+    pub root_page: u32,
+}
+
+/// Columns that get an automatic index, in the order SQLite creates and numbers
+/// them: one per column (PRIMARY KEY and UNIQUE on the same column share one),
+/// in column order.
+pub fn autoindex_columns(columns: &[Column]) -> Vec<usize> {
+    columns
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.is_unique || (c.is_primary_key && !c.is_rowid_alias))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// SQLite's name for the `n`-th (1-based) automatic index of `table`.
+pub fn autoindex_name(table: &str, n: usize) -> String {
+    format!("sqlite_autoindex_{}_{}", table, n)
 }
 
 /// The record SQLite stores in a single-column index on a rowid table:
@@ -496,6 +529,7 @@ pub fn deserialize_table(data: &[u8]) -> io::Result<Table> {
             is_autoincrement: is_autoinc,
             is_not_null,
             is_unique,
+            is_rowid_alias: false,
             default_text,
         });
     }
@@ -505,6 +539,7 @@ pub fn deserialize_table(data: &[u8]) -> io::Result<Table> {
         columns,
         root_page,
         sql: String::new(),
+        indexes: Vec::new(),
     })
 }
 
@@ -561,6 +596,7 @@ mod tests {
                     is_autoincrement: true,
                     is_not_null: false,
                     is_unique: false,
+                    is_rowid_alias: true,
                     default_text: None,
                 },
                 Column {
@@ -570,11 +606,13 @@ mod tests {
                     is_autoincrement: false,
                     is_not_null: false,
                     is_unique: false,
+                    is_rowid_alias: false,
                     default_text: Some("unnamed".to_string()),
                 },
             ],
             root_page: 42,
             sql: "CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT DEFAULT 'unnamed');".to_string(),
+            indexes: Vec::new(),
         };
         let bytes = serialize_table(&t);
         let t2 = deserialize_table(&bytes).unwrap();
@@ -634,6 +672,31 @@ mod tests {
             compare_records(&[Null, Integer(1)], &[Null, Integer(2)]),
             Ordering::Less
         );
+    }
+
+    #[test]
+    fn test_autoindex_columns_follow_sqlite_rules() {
+        let col = |name: &str, pk: bool, alias: bool, unique: bool| Column {
+            name: name.to_string(),
+            data_type: DataType::Text,
+            is_primary_key: pk,
+            is_autoincrement: false,
+            is_not_null: false,
+            is_unique: unique,
+            is_rowid_alias: alias,
+            default_text: None,
+        };
+        // CREATE TABLE t (id INTEGER PRIMARY KEY, a UNIQUE, b, c TEXT PRIMARY KEY UNIQUE)
+        let cols = vec![
+            col("id", true, true, false),
+            col("a", false, false, true),
+            col("b", false, false, false),
+            col("c", true, false, true),
+        ];
+        assert_eq!(autoindex_columns(&cols), vec![1, 3]);
+        // INTEGER PRIMARY KEY UNIQUE still gets an index for the UNIQUE.
+        assert_eq!(autoindex_columns(&[col("id", true, true, true)]), vec![0]);
+        assert_eq!(autoindex_name("t", 2), "sqlite_autoindex_t_2");
     }
 
     #[test]
