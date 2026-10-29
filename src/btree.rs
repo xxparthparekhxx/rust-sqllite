@@ -530,31 +530,387 @@ fn split_leaf(
     })
 }
 
-/// Delete a key from the tree. Returns true if the key was found and deleted.
-pub fn delete(store: &mut dyn PageStore, root_page: u32, key: u64) -> io::Result<bool> {
-    let mut page = store.read_page(root_page)?;
-    if is_leaf(&page) {
-        let cells = collect_leaf_cells(&page);
-        let orig_len = cells.len();
-        let new_cells: Vec<(u64, Vec<u8>)> = cells.into_iter().filter(|(k, _)| *k != key).collect();
-        if new_cells.len() == orig_len {
-            return Ok(false);
+// ──────────────── Delete and rebalancing ────────────────
+//
+// A delete decodes the pages on the path from the root to the leaf into `Node`s,
+// removes the row, and writes the path back from the bottom up, the way
+// `index::balance` does for index B-trees:
+//
+// - a non-root page that runs low (below `MIN_FILL`, in particular an empty one)
+//   is merged with a sibling, and the parent loses the divider between them and
+//   the pointer to the emptied page, which goes on the freelist; if the two do
+//   not fit on one page, they are split evenly between the two pages instead and
+//   the parent gets a new divider;
+// - a page that overflows (only an interior page can, when a divider below it is
+//   replaced by a longer varint) is split, and its parent gets the new divider;
+// - an interior root left with a single child takes over that child's contents,
+//   so the root page number recorded in sqlite_schema never changes.
+//
+// SQLite reports any empty non-root page as corruption, so none is left behind.
+// Dividers follow the convention of `split_leaf`: a divider is at least the largest
+// rowid of the subtree on its left and below every rowid of the subtree on its
+// right; a divider set by a redistribution is the largest rowid of the left page.
+
+/// A non-root page whose encoded size drops below this is merged with, or
+/// refilled from, a sibling (the threshold the index B-tree uses too).
+const MIN_FILL: usize = PAGE_SIZE / 3;
+
+/// One decoded table B-tree page.
+#[derive(Debug, Clone, Default)]
+struct Node {
+    /// Leaf cells, (rowid, record) in rowid order. Empty for an interior page.
+    cells: Vec<(u64, Vec<u8>)>,
+    /// Interior dividers: `keys[i]` bounds the rowids under `children[i]` from
+    /// above, and is below every rowid under `children[i + 1]`.
+    keys: Vec<u64>,
+    /// Child pages, `keys.len() + 1` of them, the last being the right child.
+    /// Empty for a leaf.
+    children: Vec<u32>,
+}
+
+impl Node {
+    fn is_leaf(&self) -> bool {
+        self.children.is_empty()
+    }
+
+    /// Bytes the node needs on a page whose B-tree header starts at `hdr_off`
+    /// (100 on page 1, 0 elsewhere): header, cell pointers and cells.
+    fn byte_size(&self, hdr_off: usize) -> usize {
+        hdr_off
+            + if self.is_leaf() {
+                LEAF_HEADER_SIZE
+                    + self
+                        .cells
+                        .iter()
+                        .map(|(k, v)| leaf_cell_size(*k, v) + CELL_PTR_SIZE)
+                        .sum::<usize>()
+            } else {
+                INTERNAL_HEADER_SIZE
+                    + self
+                        .keys
+                        .iter()
+                        .map(|k| internal_cell_size(*k) + CELL_PTR_SIZE)
+                        .sum::<usize>()
+            }
+    }
+
+    fn fits(&self, hdr_off: usize) -> bool {
+        self.byte_size(hdr_off) <= PAGE_SIZE
+    }
+}
+
+fn decode(page: &[u8; PAGE_SIZE], page_num: u32) -> io::Result<Node> {
+    match node_type(page) {
+        LEAF_NODE => Ok(Node {
+            cells: collect_leaf_cells(page),
+            ..Node::default()
+        }),
+        INTERNAL_NODE => {
+            let cells = collect_internal_cells(page);
+            let keys = cells.iter().map(|&(_, k)| k).collect();
+            let mut children: Vec<u32> = cells.iter().map(|&(c, _)| c).collect();
+            children.push(right_child(page));
+            Ok(Node {
+                cells: Vec::new(),
+                keys,
+                children,
+            })
         }
-        rebuild_leaf_page(&mut page, &new_cells);
-        store.write_page(root_page, page)?;
-        Ok(true)
+        t => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("table page {}: unexpected page type {:#04x}", page_num, t),
+        )),
+    }
+}
+
+/// Write `node` into `page`, packed: cells contiguous at the end of the page, in
+/// key order, with no freeblocks or fragments. Whatever precedes the B-tree header
+/// (page 1's file header) is kept.
+fn encode(node: &Node, page: &mut [u8; PAGE_SIZE]) {
+    debug_assert!(node.fits(page_offset(page)));
+    let leaf = node.is_leaf();
+    if leaf {
+        init_leaf_page(page);
     } else {
-        let n = cell_count(&page);
-        for i in 0..n {
-            let off = cell_ptr(&page, i) as usize;
-            let (child, k) = read_internal_cell(&page, off);
-            if key <= k {
-                return delete(store, child, key);
+        let right = *node
+            .children
+            .last()
+            .expect("interior node has a right child");
+        init_internal_page(page, right);
+    }
+    let hdr = header_size(page);
+    let n = if leaf {
+        node.cells.len()
+    } else {
+        node.keys.len()
+    };
+    let mut top = PAGE_SIZE;
+    for i in 0..n {
+        if leaf {
+            let (key, value) = &node.cells[i];
+            top -= leaf_cell_size(*key, value);
+            let mut off = top;
+            off += put_varint(&mut page[off..], value.len() as u64);
+            off += put_varint(&mut page[off..], *key);
+            page[off..off + value.len()].copy_from_slice(value);
+        } else {
+            let key = node.keys[i];
+            top -= internal_cell_size(key);
+            write_u32(page, top, node.children[i]);
+            put_varint(&mut page[top + 4..], key);
+        }
+        set_cell_ptr(page, hdr, i as u16, top as u16);
+    }
+    set_cell_count(page, n as u16);
+    set_cell_area_start(page, top as u16);
+}
+
+fn read_node(store: &mut dyn PageStore, page_num: u32) -> io::Result<Node> {
+    decode(&store.read_page(page_num)?, page_num)
+}
+
+/// Write `node` to `page_num`, a page that is not the root.
+fn write_node(store: &mut dyn PageStore, page_num: u32, node: &Node) -> io::Result<()> {
+    if !node.fits(0) {
+        return Err(io::Error::other(format!(
+            "table page {}: node does not fit on a page",
+            page_num
+        )));
+    }
+    let mut page = [0u8; PAGE_SIZE];
+    encode(node, &mut page);
+    store.write_page(page_num, page)
+}
+
+/// Split `node` into two halves that each fit on a page and keep at least one
+/// cell, as even in bytes as possible. Returns (left, divider, right). A leaf's
+/// divider is the largest rowid of the left half; an interior page's is the key
+/// between the halves, which moves up into the parent.
+fn split(node: Node) -> io::Result<(Node, u64, Node)> {
+    if node.is_leaf() {
+        let mut cells = node.cells;
+        let sizes: Vec<usize> = cells
+            .iter()
+            .map(|(k, v)| leaf_cell_size(*k, v) + CELL_PTR_SIZE)
+            .collect();
+        let total: usize = sizes.iter().sum();
+        let mut best = (usize::MAX, 0);
+        let mut left = 0;
+        for m in 1..cells.len() {
+            left += sizes[m - 1];
+            let worst = left.max(total - left);
+            if worst < best.0 {
+                best = (worst, m);
             }
         }
-        let rc = right_child(&page);
-        delete(store, rc, key)
+        let (worst, m) = best;
+        if m == 0 || LEAF_HEADER_SIZE + worst > PAGE_SIZE {
+            return Err(io::Error::other("table leaf split cannot fit both halves"));
+        }
+        let right = cells.split_off(m);
+        let divider = cells[m - 1].0;
+        Ok((
+            Node {
+                cells,
+                ..Node::default()
+            },
+            divider,
+            Node {
+                cells: right,
+                ..Node::default()
+            },
+        ))
+    } else {
+        let (mut keys, mut children) = (node.keys, node.children);
+        let n = keys.len();
+        let sizes: Vec<usize> = keys
+            .iter()
+            .map(|k| internal_cell_size(*k) + CELL_PTR_SIZE)
+            .collect();
+        let total: usize = sizes.iter().sum();
+        let mut best = (usize::MAX, 0);
+        let mut left = 0;
+        for d in 1..n.saturating_sub(1) {
+            left += sizes[d - 1];
+            let worst = left.max(total - left - sizes[d]);
+            if worst < best.0 {
+                best = (worst, d);
+            }
+        }
+        let (worst, d) = best;
+        if d == 0 || INTERNAL_HEADER_SIZE + worst > PAGE_SIZE {
+            return Err(io::Error::other(
+                "table interior split cannot fit both halves",
+            ));
+        }
+        let right_keys = keys.split_off(d + 1);
+        let divider = keys.pop().expect("divider key");
+        let right_children = children.split_off(d + 1);
+        Ok((
+            Node {
+                cells: Vec::new(),
+                keys,
+                children,
+            },
+            divider,
+            Node {
+                cells: Vec::new(),
+                keys: right_keys,
+                children: right_children,
+            },
+        ))
     }
+}
+
+/// Concatenate two siblings and the parent's divider between them. Leaves drop
+/// the divider (it is only a bound); interior pages pull it down between the left
+/// page's right child and the right page's first child.
+fn join(mut left: Node, divider: u64, right: Node) -> Node {
+    if left.is_leaf() {
+        left.cells.extend(right.cells);
+    } else {
+        left.keys.push(divider);
+        left.keys.extend(right.keys);
+        left.children.extend(right.children);
+    }
+    left
+}
+
+/// One page on the path from the root to the leaf being changed.
+struct Level {
+    page_num: u32,
+    node: Node,
+    /// Index into `node.children` of the next page down the path.
+    child: usize,
+    /// Whether `node` differs from what is on disk.
+    modified: bool,
+}
+
+/// Delete `key` from the tree rooted at `root_page`, rebalancing as needed (see
+/// above). The root page never changes. Returns true if the key was found.
+pub fn delete(store: &mut dyn PageStore, root_page: u32, key: u64) -> io::Result<bool> {
+    let mut path: Vec<Level> = Vec::new();
+    let mut page_num = root_page;
+    loop {
+        let mut node = read_node(store, page_num)?;
+        if node.is_leaf() {
+            match node.cells.binary_search_by_key(&key, |(k, _)| *k) {
+                Ok(i) => {
+                    node.cells.remove(i);
+                }
+                Err(_) => return Ok(false),
+            }
+            path.push(Level {
+                page_num,
+                node,
+                child: 0,
+                modified: true,
+            });
+            break;
+        }
+        // The first child whose divider is >= key, else the right child.
+        let child = node.keys.partition_point(|&k| k < key);
+        let next = node.children[child];
+        path.push(Level {
+            page_num,
+            node,
+            child,
+            modified: false,
+        });
+        page_num = next;
+    }
+    balance(store, path)?;
+    Ok(true)
+}
+
+/// Write back every modified page on `path`, from the bottom up, merging or
+/// refilling non-root pages that run low and splitting pages that overflow.
+fn balance(store: &mut dyn PageStore, mut path: Vec<Level>) -> io::Result<()> {
+    for level in (1..path.len()).rev() {
+        let (upper, lower) = path.split_at_mut(level);
+        let parent = upper.last_mut().expect("parent level");
+        let cur = &mut lower[0];
+        if !cur.modified {
+            continue;
+        }
+        let ci = parent.child;
+        debug_assert_eq!(parent.node.children[ci], cur.page_num);
+
+        if !cur.node.fits(0) {
+            // Overflow: keep the left half here, move the right half to a new page,
+            // and give the parent the divider between them.
+            let (left, divider, right) = split(std::mem::take(&mut cur.node))?;
+            write_node(store, cur.page_num, &left)?;
+            let new_page = store.allocate_page()?;
+            write_node(store, new_page, &right)?;
+            parent.node.keys.insert(ci, divider);
+            parent.node.children.insert(ci + 1, new_page);
+            parent.modified = true;
+        } else if cur.node.byte_size(0) < MIN_FILL && !parent.node.keys.is_empty() {
+            // Underflow: combine with the left sibling (the right one for the first
+            // child). The parent has a divider here: interior pages on disk have
+            // one (except an uncollapsible page-1 root, excluded above), and only
+            // this level removes dividers from the parent.
+            let li = ci.saturating_sub(1);
+            let (left_pg, right_pg) = (parent.node.children[li], parent.node.children[li + 1]);
+            let this = std::mem::take(&mut cur.node);
+            let (left, right) = if li == ci {
+                (this, read_node(store, right_pg)?)
+            } else {
+                (read_node(store, left_pg)?, this)
+            };
+            let merged = join(left, parent.node.keys[li], right);
+            if merged.fits(0) {
+                // The merged page keeps the right page's upper bound: the divider
+                // after it in the parent (or the parent's own bound) still holds.
+                write_node(store, left_pg, &merged)?;
+                store.free_page(right_pg)?;
+                parent.node.keys.remove(li);
+                parent.node.children.remove(li + 1);
+            } else {
+                let (l, divider, r) = split(merged)?;
+                write_node(store, left_pg, &l)?;
+                write_node(store, right_pg, &r)?;
+                parent.node.keys[li] = divider;
+            }
+            parent.modified = true;
+        } else {
+            write_node(store, cur.page_num, &cur.node)?;
+        }
+    }
+
+    let root = &mut path[0];
+    if !root.modified {
+        return Ok(());
+    }
+    let mut page = store.read_page(root.page_num)?;
+    let hdr_off = page_offset(&page);
+    if !root.node.fits(hdr_off) {
+        // Root overflow: move both halves into new children so that the root page
+        // number (recorded in sqlite_schema) stays the same.
+        let (left, divider, right) = split(std::mem::take(&mut root.node))?;
+        let left_pg = store.allocate_page()?;
+        write_node(store, left_pg, &left)?;
+        let right_pg = store.allocate_page()?;
+        write_node(store, right_pg, &right)?;
+        root.node = Node {
+            cells: Vec::new(),
+            keys: vec![divider],
+            children: vec![left_pg, right_pg],
+        };
+    } else if !root.node.is_leaf() && root.node.keys.is_empty() {
+        // An interior root with a single child: pull the child up into the root.
+        // (Its contents always fit unless the root is page 1, which has 100 bytes
+        // less; SQLite accepts an interior page 1 without cells, so it then stays.)
+        let only = root.node.children[0];
+        let child = read_node(store, only)?;
+        if child.fits(hdr_off) {
+            root.node = child;
+            store.free_page(only)?;
+        }
+    }
+    encode(&root.node, &mut page);
+    store.write_page(root.page_num, page)
 }
 
 // ──────────────── Page-level helpers ────────────────
@@ -688,11 +1044,12 @@ fn rebuild_internal_page(page: &mut [u8; PAGE_SIZE], cells: &[(u32, u64)], right
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-    /// In-memory page store for testing.
+    /// In-memory page store for testing, with a freelist that is reused first.
     struct MemStore {
         pages: HashMap<u32, [u8; PAGE_SIZE]>,
+        free: Vec<u32>,
         next_page: u32,
     }
 
@@ -700,32 +1057,160 @@ mod tests {
         fn new() -> Self {
             MemStore {
                 pages: HashMap::new(),
-                next_page: 0,
+                free: Vec::new(),
+                next_page: 2,
             }
         }
     }
 
     impl PageStore for MemStore {
         fn read_page(&mut self, page_num: u32) -> io::Result<[u8; PAGE_SIZE]> {
-            Ok(self
-                .pages
+            self.pages
                 .get(&page_num)
                 .copied()
-                .unwrap_or([0u8; PAGE_SIZE]))
+                .ok_or_else(|| io::Error::other(format!("read of unallocated page {}", page_num)))
         }
         fn write_page(&mut self, page_num: u32, data: [u8; PAGE_SIZE]) -> io::Result<()> {
+            assert!(
+                !self.free.contains(&page_num),
+                "write to free page {}",
+                page_num
+            );
             self.pages.insert(page_num, data);
             Ok(())
         }
         fn allocate_page(&mut self) -> io::Result<u32> {
+            if let Some(p) = self.free.pop() {
+                return Ok(p);
+            }
             let p = self.next_page;
             self.next_page += 1;
             Ok(p)
         }
         fn free_page(&mut self, page_num: u32) -> io::Result<()> {
+            assert!(
+                !self.free.contains(&page_num),
+                "double free of page {}",
+                page_num
+            );
             self.pages.remove(&page_num);
+            self.free.push(page_num);
             Ok(())
         }
+    }
+
+    /// Tiny deterministic PRNG (xorshift64*), so tests need no dependencies.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545F4914F6CDD1D)
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    /// Check the tree rooted at `root` the way `PRAGMA integrity_check` does:
+    /// rowids increase and stay inside the bounds the dividers above them set
+    /// (left subtree <= divider < right subtree), every leaf is at the same depth,
+    /// no page but a leaf root is empty, and no page is used twice. Also check
+    /// that every allocated page is either in the tree or free. Returns the rowids.
+    fn check_tree(store: &mut MemStore, root: u32) -> Vec<u64> {
+        struct Walk {
+            keys: Vec<u64>,
+            leaf_depth: Option<usize>,
+            pages: BTreeSet<u32>,
+        }
+        fn walk(
+            store: &mut MemStore,
+            w: &mut Walk,
+            pn: u32,
+            depth: usize,
+            lo: Option<u64>,
+            hi: Option<u64>,
+        ) {
+            assert!(w.pages.insert(pn), "page {} used twice", pn);
+            let page = store.read_page(pn).unwrap();
+            let n = cell_count(&page);
+            assert!(
+                n > 0 || (depth == 0 && is_leaf(&page)),
+                "page {} is empty (depth {})",
+                pn,
+                depth
+            );
+            let in_bounds = |k: u64| lo.is_none_or(|lo| k > lo) && hi.is_none_or(|hi| k <= hi);
+            if is_leaf(&page) {
+                match w.leaf_depth {
+                    Some(d) => assert_eq!(d, depth, "page {}: leaf depth differs", pn),
+                    None => w.leaf_depth = Some(depth),
+                }
+                for i in 0..n {
+                    let (k, _) = read_leaf_cell(&page, cell_ptr(&page, i) as usize);
+                    assert!(
+                        in_bounds(k),
+                        "page {}: rowid {} outside ({:?}, {:?}]",
+                        pn,
+                        k,
+                        lo,
+                        hi
+                    );
+                    assert!(
+                        w.keys.last().is_none_or(|&p| k > p),
+                        "page {}: rowid {} out of order",
+                        pn,
+                        k
+                    );
+                    w.keys.push(k);
+                }
+                return;
+            }
+            let mut lower = lo;
+            for i in 0..n {
+                let (child, k) = read_internal_cell(&page, cell_ptr(&page, i) as usize);
+                assert!(
+                    in_bounds(k) && lower.is_none_or(|l| k > l),
+                    "page {}: divider {} out of order",
+                    pn,
+                    k
+                );
+                walk(store, w, child, depth + 1, lower, Some(k));
+                lower = Some(k);
+            }
+            walk(store, w, right_child(&page), depth + 1, lower, hi);
+        }
+        let mut w = Walk {
+            keys: Vec::new(),
+            leaf_depth: None,
+            pages: BTreeSet::new(),
+        };
+        walk(store, &mut w, root, 0, None, None);
+        let mut accounted = w.pages.clone();
+        for &f in &store.free {
+            assert!(accounted.insert(f), "page {} is both used and free", f);
+        }
+        let allocated: BTreeSet<u32> = (2..store.next_page).collect();
+        assert_eq!(accounted, allocated, "pages leaked");
+        w.keys
+    }
+
+    /// The row stored under rowid `i` in the delete tests, a little like
+    /// 'value N padded out a little'.
+    fn row(i: u64) -> Vec<u8> {
+        format!("value {} padded out a little", i).into_bytes()
+    }
+
+    fn tree_depth(store: &mut MemStore, root: u32) -> usize {
+        let mut depth = 0;
+        let mut page = store.read_page(root).unwrap();
+        while !is_leaf(&page) {
+            depth += 1;
+            let (child, _) = read_internal_cell(&page, cell_ptr(&page, 0) as usize);
+            page = store.read_page(child).unwrap();
+        }
+        depth
     }
 
     fn make_root(store: &mut MemStore) -> u32 {
@@ -877,5 +1362,272 @@ mod tests {
 
         // Delete non-existent key.
         assert!(!delete(&mut store, root, 99).unwrap());
+    }
+
+    #[test]
+    fn test_btree_range_deletes_leave_no_empty_pages() {
+        // 2000 rows, then a contiguous range deleted one rowid at a time, the way
+        // `DELETE FROM p WHERE id <= 1000` does it.
+        let n = 2000u64;
+        let patterns: Vec<(&str, Vec<u64>)> = vec![
+            ("lower half", (1..=n / 2).collect()),
+            ("upper half", (n / 2 + 1..=n).collect()),
+            ("middle", (n / 4..=3 * n / 4).collect()),
+            ("lower half, descending", (1..=n / 2).rev().collect()),
+            ("all but the ends", (2..n).collect()),
+        ];
+        for (name, doomed) in patterns {
+            let mut store = MemStore::new();
+            let mut root = make_root(&mut store);
+            for i in 1..=n {
+                root = insert(&mut store, root, i, &row(i)).unwrap();
+            }
+            assert!(tree_depth(&mut store, root) >= 1);
+            for (j, &k) in doomed.iter().enumerate() {
+                assert!(
+                    delete(&mut store, root, k).unwrap(),
+                    "{}: missing {}",
+                    name,
+                    k
+                );
+                if j % 97 == 0 {
+                    check_tree(&mut store, root);
+                }
+            }
+            let gone: BTreeSet<u64> = doomed.iter().copied().collect();
+            let want: Vec<u64> = (1..=n).filter(|k| !gone.contains(k)).collect();
+            assert_eq!(check_tree(&mut store, root), want, "{}", name);
+            assert!(!store.free.is_empty(), "{}: no page was freed", name);
+            for k in [1, n / 4 - 1, n / 2, n / 2 + 1, n] {
+                let expect = (!gone.contains(&k)).then(|| row(k));
+                assert_eq!(
+                    search(&mut store, root, k).unwrap(),
+                    expect,
+                    "{}: rowid {}",
+                    name,
+                    k
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_btree_delete_everything_collapses_root_and_frees_pages() {
+        let n = 10_000u64;
+        let mut store = MemStore::new();
+        let mut root = make_root(&mut store);
+        for i in 1..=n {
+            root = insert(&mut store, root, i, &row(i)).unwrap();
+        }
+        assert!(tree_depth(&mut store, root) >= 1);
+        let allocated = store.next_page;
+        for i in 1..=n {
+            assert!(delete(&mut store, root, i).unwrap());
+        }
+        assert!(!delete(&mut store, root, 1).unwrap());
+        // The root stays where it is (sqlite_schema points at it), now an empty
+        // leaf; every other page is on the freelist.
+        assert!(check_tree(&mut store, root).is_empty());
+        assert!(is_leaf(&store.read_page(root).unwrap()));
+        assert_eq!(store.free.len() as u32, allocated - 2 - 1);
+
+        // Inserting again reuses the freed pages before growing the file.
+        for i in 1..=n {
+            root = insert(&mut store, root, i, &row(i)).unwrap();
+        }
+        assert_eq!(check_tree(&mut store, root), (1..=n).collect::<Vec<_>>());
+        assert!(store.next_page <= allocated + 1);
+    }
+
+    #[test]
+    fn test_btree_random_churn_with_mixed_row_sizes() {
+        // Rows of 1 to 1500 bytes, so some leaves hold dozens of rows and some two:
+        // merges, redistributions, and rebalancing of interior pages all happen,
+        // on a tree with two interior levels.
+        let mut store = MemStore::new();
+        let mut root = make_root(&mut store);
+        let mut rng = Rng(0x5EED);
+        let mut live: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+        let mut keys: Vec<u64> = Vec::new();
+        fn value(rng: &mut Rng, k: u64) -> Vec<u8> {
+            let len = if rng.below(4) == 0 {
+                600 + rng.below(900)
+            } else {
+                1 + rng.below(60)
+            };
+            vec![(k % 251) as u8; len]
+        }
+        while live.len() < 8000 {
+            let k = 1 + rng.below(1_000_000) as u64;
+            let v = value(&mut rng, k);
+            root = insert(&mut store, root, k, &v).unwrap();
+            if live.insert(k, v).is_none() {
+                keys.push(k);
+            }
+        }
+        assert!(
+            tree_depth(&mut store, root) >= 2,
+            "expected two interior levels"
+        );
+        assert_eq!(
+            check_tree(&mut store, root),
+            live.keys().copied().collect::<Vec<_>>()
+        );
+
+        // Mostly deletes, some inserts, until the table is empty.
+        let mut step = 0;
+        while !keys.is_empty() {
+            if keys.len() > 100 && rng.below(4) == 0 {
+                let k = 1 + rng.below(1_000_000) as u64;
+                let v = value(&mut rng, k);
+                root = insert(&mut store, root, k, &v).unwrap();
+                if live.insert(k, v).is_none() {
+                    keys.push(k);
+                }
+            } else {
+                let k = keys.swap_remove(rng.below(keys.len()));
+                live.remove(&k);
+                assert!(delete(&mut store, root, k).unwrap(), "missing {}", k);
+                assert!(!delete(&mut store, root, k).unwrap());
+            }
+            step += 1;
+            if step % 500 == 0 {
+                assert_eq!(
+                    check_tree(&mut store, root),
+                    live.keys().copied().collect::<Vec<_>>()
+                );
+                let probe = keys[rng.below(keys.len())];
+                assert_eq!(
+                    search(&mut store, root, probe).unwrap().as_ref(),
+                    live.get(&probe)
+                );
+            }
+        }
+        assert!(check_tree(&mut store, root).is_empty());
+        assert_eq!(tree_depth(&mut store, root), 0);
+    }
+
+    /// A new leaf page holding `rows`.
+    fn leaf_with(store: &mut MemStore, rows: &[(u64, Vec<u8>)]) -> u32 {
+        let pn = store.allocate_page().unwrap();
+        let mut page = [0u8; PAGE_SIZE];
+        init_leaf_page(&mut page);
+        for (k, v) in rows {
+            insert_leaf_cell(&mut page, *k, v);
+        }
+        store.write_page(pn, page).unwrap();
+        pn
+    }
+
+    /// An interior page with no byte to spare, over leaves. The first leaf holds
+    /// rowids 1..=10 (100-byte rows) under divider 100, a 1-byte varint; the second
+    /// holds rowids 20000..=20010 (300-byte rows); the others one row each. Returns
+    /// the page and every row under it, in order.
+    fn full_interior_page(store: &mut MemStore) -> ([u8; PAGE_SIZE], Vec<(u64, Vec<u8>)>) {
+        fn add(
+            store: &mut MemStore,
+            page: &mut [u8; PAGE_SIZE],
+            rows: &mut Vec<(u64, Vec<u8>)>,
+            k: u64,
+        ) {
+            let one = vec![(k, b"x".to_vec())];
+            insert_internal_cell(page, leaf_with(store, &one), k);
+            rows.extend(one);
+        }
+        let small: Vec<(u64, Vec<u8>)> = (1..=10).map(|k| (k, vec![b's'; 100])).collect();
+        let big: Vec<(u64, Vec<u8>)> = (20000..=20010).map(|k| (k, vec![b'b'; 300])).collect();
+        let mut page = [0u8; PAGE_SIZE];
+        init_internal_page(&mut page, 0);
+        insert_internal_cell(&mut page, leaf_with(store, &small), 100);
+        insert_internal_cell(&mut page, leaf_with(store, &big), 20010);
+        let mut rows: Vec<(u64, Vec<u8>)> = small.into_iter().chain(big).collect();
+        // Fill with 9-byte cells (3-byte varint keys), then finish with 10-byte
+        // ones (4-byte keys) so that the page is full exactly.
+        let mut key = 30_000;
+        while free_space_internal(&page) > 200 {
+            add(store, &mut page, &mut rows, key);
+            key += 10;
+        }
+        let f = free_space_internal(&page);
+        let wide = (0..=f / 10).find(|b| (f - 10 * b) % 9 == 0).unwrap();
+        for _ in 0..(f - 10 * wide) / 9 {
+            add(store, &mut page, &mut rows, key);
+            key += 10;
+        }
+        key = 3_000_000;
+        for _ in 0..wide {
+            add(store, &mut page, &mut rows, key);
+            key += 10;
+        }
+        assert_eq!(free_space_internal(&page), 0);
+        let last = vec![(key, b"r".to_vec())];
+        set_right_child(&mut page, leaf_with(store, &last));
+        rows.extend(last);
+        (page, rows)
+    }
+
+    #[test]
+    fn test_btree_delete_splits_interior_page_when_a_divider_grows() {
+        // Deleting rowid 1 refills the first leaf from the second; the new divider
+        // between them is a 3-byte varint where there was a 1-byte one, which no
+        // longer fits on the full interior page above them, so that page splits.
+        for as_root in [true, false] {
+            let mut store = MemStore::new();
+            let (page, mut rows) = full_interior_page(&mut store);
+            let full = store.allocate_page().unwrap();
+            store.write_page(full, page).unwrap();
+            let root = if as_root {
+                full
+            } else {
+                // A root over the full page and a small interior page after it.
+                let top = rows.last().unwrap().0;
+                let tail = vec![(top + 10, b"t".to_vec()), (top + 20, b"u".to_vec())];
+                let mut second = [0u8; PAGE_SIZE];
+                init_interior_with(&mut store, &mut second, &tail);
+                let second_pn = store.allocate_page().unwrap();
+                store.write_page(second_pn, second).unwrap();
+                rows.extend(tail);
+                let mut root_page = [0u8; PAGE_SIZE];
+                init_internal_page(&mut root_page, second_pn);
+                insert_internal_cell(&mut root_page, full, top);
+                let root = store.allocate_page().unwrap();
+                store.write_page(root, root_page).unwrap();
+                root
+            };
+            let all: Vec<u64> = rows.iter().map(|r| r.0).collect();
+            assert_eq!(check_tree(&mut store, root), all);
+            let depth = tree_depth(&mut store, root);
+
+            assert!(delete(&mut store, root, 1).unwrap());
+            assert_eq!(check_tree(&mut store, root), all[1..].to_vec());
+            if as_root {
+                // The root split into two new children and stayed where it was.
+                assert_eq!(tree_depth(&mut store, root), depth + 1);
+            } else {
+                let top = store.read_page(root).unwrap();
+                assert_eq!(cell_count(&top), 2, "the root should have gained a divider");
+            }
+            for k in 2..=10 {
+                assert!(delete(&mut store, root, k).unwrap());
+            }
+            assert_eq!(check_tree(&mut store, root), all[10..].to_vec());
+            for (k, v) in &rows[10..] {
+                assert_eq!(search(&mut store, root, *k).unwrap().as_ref(), Some(v));
+            }
+        }
+    }
+
+    /// Make `page` an interior page over one-row leaves holding `rows`: one cell
+    /// per row but the last, whose leaf is the right child.
+    fn init_interior_with(
+        store: &mut MemStore,
+        page: &mut [u8; PAGE_SIZE],
+        rows: &[(u64, Vec<u8>)],
+    ) {
+        let (last, cells) = rows.split_last().unwrap();
+        init_internal_page(page, leaf_with(store, std::slice::from_ref(last)));
+        for r in cells {
+            insert_internal_cell(page, leaf_with(store, std::slice::from_ref(r)), r.0);
+        }
     }
 }

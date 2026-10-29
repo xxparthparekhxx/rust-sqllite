@@ -9,9 +9,9 @@ Database files are fully compatible with the official SQLite 3 format and can be
 - **SQLite 3 File Format** — Standard page-based storage with 100-byte file header, B-Tree pages, and varint encoding
 - **Record Format** — Rows serialized using SQLite's standard serial type system (big-endian, variable-width integers)
 - **`sqlite_schema` Table** — Standard system catalog on Page 1 for tool compatibility
-- **B-Tree Engine** — Table B-Trees with `u64` rowids, cell pointer arrays, and page splitting
+- **B-Tree Engine** — Table B-Trees with `u64` rowids, cell pointer arrays, and page splitting; on `DELETE`, a page that runs low is merged into or refilled from a sibling, so no empty page is left behind, and the root page never moves
 - **Automatic Indexes** — Every `UNIQUE` column, and every `PRIMARY KEY` that is not `INTEGER PRIMARY KEY`, gets the `sqlite_autoindex_<table>_<n>` index SQLite expects: an index B-Tree kept up to date on `INSERT`, `UPDATE` and `DELETE`, which `sqlite3` uses for lookups
-- **Freelist** — Pages released by index merges and `DROP TABLE` go on SQLite's freelist and are reused
+- **Freelist** — Pages released by table and index merges and by `DROP TABLE` go on SQLite's freelist and are reused
 - **Write-Ahead Logging (WAL)** — Crash-safe atomic commits with checkpoint support
 - **4KB Paged Storage** — LRU-cached page I/O with proper 1-based page indexing
 - **SQL Parser** — Hand-written recursive descent parser supporting:
@@ -110,7 +110,7 @@ db.close().unwrap();
 cargo test
 ```
 
-Includes 43 unit tests, 28 integration tests, and doc tests covering the B-Trees, pager, WAL, SQL parser, record format, and full engine operations. The tests in `tests/autoindex.rs` run the `sqlite3` CLI (when installed) to check `PRAGMA integrity_check`, query plans and query results on files this engine wrote.
+Includes 48 unit tests, 33 integration tests, and doc tests covering the B-Trees, pager, WAL, SQL parser, record format, and full engine operations. The tests in `tests/autoindex.rs` and `tests/table_delete.rs` run the `sqlite3` CLI (when installed) to check `PRAGMA integrity_check`, query plans and query results on files this engine wrote.
 
 ## 📋 SQLite Compatibility
 
