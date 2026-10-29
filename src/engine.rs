@@ -980,9 +980,7 @@ impl Engine {
     /// rows inserted without one) come after it instead of colliding with it.
     fn note_rowid_used(&mut self, table_name: &str, rowid: i64) {
         if let Some(next) = self.next_rowid.get_mut(table_name) {
-            if *next <= rowid {
-                *next = rowid.saturating_add(1);
-            }
+            *next = (*next).max(rowid.saturating_add(1));
         }
     }
 

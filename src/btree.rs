@@ -1549,7 +1549,9 @@ mod tests {
             key += 10;
         }
         let f = free_space_internal(&page);
-        let wide = (0..=f / 10).find(|b| (f - 10 * b) % 9 == 0).unwrap();
+        let wide = (0..=f / 10)
+            .find(|b| (f - 10 * b).is_multiple_of(9))
+            .unwrap();
         for _ in 0..(f - 10 * wide) / 9 {
             add(store, &mut page, &mut rows, key);
             key += 10;
