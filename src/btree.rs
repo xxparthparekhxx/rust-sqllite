@@ -184,6 +184,26 @@ pub trait PageStore {
     fn read_page(&mut self, page_num: u32) -> io::Result<[u8; PAGE_SIZE]>;
     fn write_page(&mut self, page_num: u32, data: [u8; PAGE_SIZE]) -> io::Result<()>;
     fn allocate_page(&mut self) -> io::Result<u32>;
+    /// Return a page that is no longer part of any B-tree to the freelist.
+    fn free_page(&mut self, page_num: u32) -> io::Result<()>;
+}
+
+/// Every page number in the table B-tree rooted at `root_page` (root included).
+pub fn collect_pages(store: &mut dyn PageStore, root_page: u32) -> io::Result<Vec<u32>> {
+    let mut out = Vec::new();
+    let mut stack = vec![root_page];
+    while let Some(pn) = stack.pop() {
+        out.push(pn);
+        let page = store.read_page(pn)?;
+        if !is_leaf(&page) {
+            for i in 0..cell_count(&page) {
+                let (child, _) = read_internal_cell(&page, cell_ptr(&page, i) as usize);
+                stack.push(child);
+            }
+            stack.push(right_child(&page));
+        }
+    }
+    Ok(out)
 }
 
 /// Search for `key` starting from `root_page`. Returns the value if found.
@@ -693,6 +713,10 @@ mod tests {
             let p = self.next_page;
             self.next_page += 1;
             Ok(p)
+        }
+        fn free_page(&mut self, page_num: u32) -> io::Result<()> {
+            self.pages.remove(&page_num);
+            Ok(())
         }
     }
 

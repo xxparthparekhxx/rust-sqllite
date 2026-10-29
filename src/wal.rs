@@ -316,6 +316,11 @@ impl Wal {
         !self.index.is_empty()
     }
 
+    /// Highest page number with a committed frame (0 if none).
+    pub fn max_page(&self) -> u32 {
+        self.index.keys().copied().max().unwrap_or(0)
+    }
+
     /// Number of committed frames.
     pub fn committed_frame_count(&self) -> usize {
         self.index.values().map(|v| v.len()).sum()

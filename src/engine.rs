@@ -3,7 +3,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::btree::{self, PageStore, init_leaf_page};
-use crate::pager::{PAGE_SIZE, Pager};
+use crate::pager::{FileHeader, PAGE_SIZE, Pager};
 use crate::schema::{Column, Row, Table, Value, deserialize_row, serialize_row};
 use crate::sql::{BinOp, ColumnDef, Expr, Parser, SelectColumn, Statement};
 use crate::wal::Wal;
@@ -137,6 +137,26 @@ impl<'a> PageStore for WalPageStore<'a> {
     }
 
     fn allocate_page(&mut self) -> io::Result<u32> {
+        // Reuse a page from the freelist first.
+        let trunk = self.pager.header.freelist_trunk_page;
+        if trunk != 0 {
+            let mut tp = self.read_page(trunk)?;
+            let leaves = read_be_u32(&tp, 4);
+            let page_num = if leaves > 0 {
+                let leaf = read_be_u32(&tp, 8 + 4 * (leaves as usize - 1));
+                write_be_u32(&mut tp, 4, leaves - 1);
+                self.write_page(trunk, tp)?;
+                leaf
+            } else {
+                // An empty trunk is handed out itself; its successor becomes the head.
+                self.pager.header.freelist_trunk_page = read_be_u32(&tp, 0);
+                trunk
+            };
+            self.pager.header.freelist_pages = self.pager.header.freelist_pages.saturating_sub(1);
+            self.sync_header()?;
+            return Ok(page_num);
+        }
+
         // We need a new page number beyond all existing ones.
         let mut max_page = self.pager.header.page_count;
         for (pn, _) in self.dirty_pages.iter() {
@@ -145,6 +165,51 @@ impl<'a> PageStore for WalPageStore<'a> {
             }
         }
         Ok(max_page + 1)
+    }
+
+    fn free_page(&mut self, page_num: u32) -> io::Result<()> {
+        // SQLite freelist: header offset 32 = first trunk page, offset 36 = total
+        // freelist pages. A trunk holds [next trunk u32][leaf count u32][leaf u32...].
+        let trunk = self.pager.header.freelist_trunk_page;
+        if trunk != 0 {
+            let mut tp = self.read_page(trunk)?;
+            let leaves = read_be_u32(&tp, 4);
+            if leaves < FREELIST_TRUNK_MAX_LEAVES {
+                write_be_u32(&mut tp, 8 + 4 * leaves as usize, page_num);
+                write_be_u32(&mut tp, 4, leaves + 1);
+                self.write_page(trunk, tp)?;
+                self.pager.header.freelist_pages += 1;
+                return self.sync_header();
+            }
+        }
+        // No trunk, or it is full: the freed page becomes the new head trunk.
+        let mut tp = [0u8; PAGE_SIZE];
+        write_be_u32(&mut tp, 0, trunk);
+        self.write_page(page_num, tp)?;
+        self.pager.header.freelist_trunk_page = page_num;
+        self.pager.header.freelist_pages += 1;
+        self.sync_header()
+    }
+}
+
+/// Leaf slots used per freelist trunk page. SQLite accepts up to usable/4 - 2 but
+/// writes at most usable/4 - 8 so that older readers stay compatible.
+const FREELIST_TRUNK_MAX_LEAVES: u32 = (PAGE_SIZE / 4 - 8) as u32;
+
+fn read_be_u32(buf: &[u8], off: usize) -> u32 {
+    u32::from_be_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
+}
+
+fn write_be_u32(buf: &mut [u8], off: usize, v: u32) {
+    buf[off..off + 4].copy_from_slice(&v.to_be_bytes());
+}
+
+impl WalPageStore<'_> {
+    /// Rewrite page 1 so the pending writes carry the current in-memory file header
+    /// (freelist fields included).
+    fn sync_header(&mut self) -> io::Result<()> {
+        let page = self.read_page(1)?;
+        self.write_page(1, page)
     }
 }
 
@@ -158,6 +223,8 @@ pub struct Engine {
     in_transaction: bool,
     /// Dirty pages accumulated during an explicit transaction.
     txn_dirty_pages: Vec<(u32, [u8; PAGE_SIZE])>,
+    /// File header (freelist fields included) as of BEGIN, restored on ROLLBACK.
+    txn_header: FileHeader,
     /// Next available auto-increment rowid per table.
     next_rowid: HashMap<String, i64>,
     /// Next available rowid for the catalog btree.
@@ -169,7 +236,19 @@ impl Engine {
     pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
         let mut pager = Pager::open(&path)?;
-        let wal = Wal::open(&path)?;
+        let mut wal = Wal::open(&path)?;
+
+        // Committed WAL frames are newer than the main file. Take the freelist from
+        // the latest page 1, and count every page in the WAL as allocated.
+        if let Some(page1) = wal.read_page(CATALOG_ROOT_PAGE)? {
+            let mut hdr = [0u8; FileHeader::SIZE];
+            hdr.copy_from_slice(&page1[..FileHeader::SIZE]);
+            if let Ok(h) = FileHeader::deserialize(&hdr) {
+                pager.header.freelist_trunk_page = h.freelist_trunk_page;
+                pager.header.freelist_pages = h.freelist_pages;
+            }
+        }
+        pager.header.page_count = pager.header.page_count.max(wal.max_page());
 
         // Ensure the catalog B-Tree root page exists (page 1).
         if pager.header.page_count < 2 {
@@ -179,12 +258,14 @@ impl Engine {
             pager.write_page(CATALOG_ROOT_PAGE, page)?;
         }
 
+        let txn_header = pager.header;
         let mut engine = Engine {
             pager,
             wal,
             schema_cache: HashMap::new(),
             in_transaction: false,
             txn_dirty_pages: Vec::new(),
+            txn_header,
             next_rowid: HashMap::new(),
             next_catalog_rowid: 1,
         };
@@ -233,8 +314,14 @@ impl Engine {
                 where_clause,
             } => self.exec_delete(&table_name, where_clause.as_ref()),
             Statement::Begin => {
+                if self.in_transaction {
+                    // The pending writes are dropped below; drop their header
+                    // (freelist) changes with them.
+                    self.pager.header = self.txn_header;
+                }
                 self.in_transaction = true;
                 self.txn_dirty_pages.clear();
+                self.txn_header = self.pager.header;
                 Ok(QueryResult::empty())
             }
             Statement::Commit => self.exec_commit(),
@@ -1090,8 +1177,9 @@ impl Engine {
         if !self.in_transaction {
             return Ok(QueryResult::empty());
         }
-        // Discard all buffered writes.
+        // Discard all buffered writes, and the freelist changes they made.
         self.txn_dirty_pages.clear();
+        self.pager.header = self.txn_header;
         self.in_transaction = false;
         // Reload schema in case we had provisional schema changes.
         self.load_catalog()?;
