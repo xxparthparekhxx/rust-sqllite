@@ -169,13 +169,18 @@ impl Wal {
         self.file.seek(SeekFrom::Start(offset))?;
         self.file.write_all(&fh)?;
         self.file.write_all(data)?;
-        self.file.flush()?;
 
         self.header.frame_count += 1;
         // Rewrite header to update frame_count.
         self.file.seek(SeekFrom::Start(0))?;
         self.file.write_all(&self.header.serialize())?;
-        self.file.flush()?;
+
+        // fsync so commit frames survive a power cut.
+        if is_commit {
+            self.file.sync_all()?;
+        } else {
+            self.file.flush()?;
+        }
 
         if is_commit {
             // Index all frames since last commit.
@@ -212,7 +217,9 @@ impl Wal {
         // Rewrite header.
         self.file.seek(SeekFrom::Start(0))?;
         self.file.write_all(&self.header.serialize())?;
-        self.file.flush()?;
+
+        // fsync so the commit frame survives a power cut.
+        self.file.sync_all()?;
 
         // Index the committed frames.
         for (i, (page_num, _)) in pages.iter().enumerate() {

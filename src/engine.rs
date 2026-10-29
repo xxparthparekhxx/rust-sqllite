@@ -695,6 +695,56 @@ impl Engine {
             };
 
             let key = rowid as u64;
+
+            // ── Constraint enforcement ──
+            // NOT NULL: a NOT NULL column may not be NULL.
+            for (idx, col) in table.columns.iter().enumerate() {
+                if col.is_not_null && row_values[idx] == Value::Null {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "NOT NULL constraint failed: {}.{}",
+                            table_name, col.name
+                        ),
+                    ));
+                }
+            }
+
+            // UNIQUE: no two rows may have the same non-NULL value in a UNIQUE column.
+            for (idx, col) in table.columns.iter().enumerate() {
+                if !col.is_unique {
+                    continue;
+                }
+                let candidate = &row_values[idx];
+                if *candidate == Value::Null {
+                    // NULLs are distinct — multiple NULLs are allowed.
+                    continue;
+                }
+                let root_page = table.root_page;
+                let mut dummy_dirty = Vec::new();
+                let mut store = WalPageStore {
+                    pager: &mut self.pager,
+                    wal: &mut self.wal,
+                    dirty_pages: &mut dummy_dirty,
+                };
+                let entries = crate::btree::scan_all(&mut store, root_page)?;
+                for (_existing_key, value) in &entries {
+                    let existing_row = match deserialize_row(value) {
+                        Ok(r) => r,
+                        Err(_) => continue,
+                    };
+                    if existing_row.get(idx) == Some(candidate) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "UNIQUE constraint failed: {}.{}",
+                                table_name, col.name
+                            ),
+                        ));
+                    }
+                }
+            }
+
             let value = serialize_row(&row_values);
 
             let root_page = table.root_page;
