@@ -228,6 +228,15 @@ fn text_at(row: &[Value], i: usize, s: &str) -> bool {
     matches!(row.get(i), Some(Value::Text(t)) if t == s)
 }
 
+/// The column whose value is the row's B-tree key (rowid): the integer PRIMARY KEY,
+/// if the table has one.
+fn rowid_column(table: &Table) -> Option<usize> {
+    table
+        .columns
+        .iter()
+        .position(|c| c.is_primary_key && c.data_type == crate::schema::DataType::Integer)
+}
+
 fn read_be_u32(buf: &[u8], off: usize) -> u32 {
     u32::from_be_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
 }
@@ -798,10 +807,7 @@ impl Engine {
             }
 
             // Generate rowid key (reuse if we already generated it for AUTOINCREMENT).
-            let rowid = if let Some((idx, ref _col)) =
-                table.columns.iter().enumerate().find(|(_, c)| {
-                    c.is_primary_key && c.data_type == crate::schema::DataType::Integer
-                }) {
+            let rowid = if let Some(idx) = rowid_column(&table) {
                 match row_values[idx] {
                     Value::Integer(v) => v,
                     _ => self.get_next_rowid(table_name),
@@ -826,26 +832,16 @@ impl Engine {
                 }
             }
 
-            // An INSERT that reuses an existing rowid overwrites that row (as this
-            // engine always has); its old index entries must then go.
-            let old_row = if table.indexes.is_empty() {
-                None
-            } else {
-                let root = self.table_root(table_name);
-                match crate::btree::search(&mut self.store(), root, key)? {
-                    Some(v) => Some(deserialize_row(&v)?),
-                    None => None,
-                }
-            };
-
-            // UNIQUE and non-rowid PRIMARY KEY columns, checked through their indexes.
-            // Any existing holder of the value conflicts, even the row being
-            // overwritten: an INSERT must not pass off a duplicate key as a rewrite.
+            // The rowid (the INTEGER PRIMARY KEY) must be free, then the UNIQUE and
+            // non-rowid PRIMARY KEY columns are checked through their indexes, in
+            // SQLite's order. A failure undoes the whole statement (see `atomic`).
+            self.check_rowid_free(&table, key)?;
             self.check_unique(&table, &row_values, rowid, None)?;
 
             let value = serialize_row(&row_values);
             self.write_row(table_name, key, &value)?;
-            self.update_indexes(&table, rowid, old_row.as_deref(), &row_values)?;
+            self.update_indexes(&table, rowid, None, &row_values)?;
+            self.note_rowid_used(table_name, rowid);
 
             count += 1;
         }
@@ -960,6 +956,31 @@ impl Engine {
             }
         }
         Ok(())
+    }
+
+    /// Fail if the table already has a row with rowid `key`. The rowid is the
+    /// INTEGER PRIMARY KEY, so SQLite reports this as a UNIQUE failure on that
+    /// column (on "rowid" if the table has none).
+    fn check_rowid_free(&mut self, table: &Table, key: u64) -> io::Result<()> {
+        let root = self.table_root(&table.name);
+        if btree::search(&mut self.store(), root, key)?.is_none() {
+            return Ok(());
+        }
+        let column = rowid_column(table).map_or("rowid", |i| table.columns[i].name.as_str());
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("UNIQUE constraint failed: {}.{}", table.name, column),
+        ))
+    }
+
+    /// Record that `rowid` is taken, so that rowids the engine picks later (for
+    /// rows inserted without one) come after it instead of colliding with it.
+    fn note_rowid_used(&mut self, table_name: &str, rowid: i64) {
+        if let Some(next) = self.next_rowid.get_mut(table_name) {
+            if *next <= rowid {
+                *next = rowid.saturating_add(1);
+            }
+        }
     }
 
     /// Bring the automatic indexes in line after row `rowid` changed from `old`
@@ -1123,13 +1144,46 @@ impl Engine {
         }
 
         // Write updated rows one at a time, as SQLite does: each row's new values are
-        // checked against the index as left by the rows before it. A conflict fails
-        // the whole statement (see `atomic`).
+        // checked against the table and the indexes as left by the rows before it.
+        // A conflict fails the whole statement (see `atomic`).
+        let rowid_col = rowid_column(&table);
         for (key, old_row, new_row) in updates {
             let rowid = key as i64;
+            let new_rowid = match rowid_col {
+                Some(c) if new_row[c] != old_row[c] => match new_row[c] {
+                    Value::Integer(v) => v,
+                    // SQLite: an INTEGER PRIMARY KEY can only hold an integer.
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "datatype mismatch",
+                        ));
+                    }
+                },
+                _ => rowid,
+            };
+            if new_rowid == rowid {
+                self.check_unique(&table, &new_row, rowid, Some(&old_row))?;
+                self.write_row(table_name, key, &serialize_row(&new_row))?;
+                self.update_indexes(&table, rowid, Some(&old_row), &new_row)?;
+                continue;
+            }
+            // A new INTEGER PRIMARY KEY is a new rowid: the row moves to that key,
+            // and every index entry of the row is rewritten with it.
+            self.check_rowid_free(&table, new_rowid as u64)?;
             self.check_unique(&table, &new_row, rowid, Some(&old_row))?;
-            self.write_row(table_name, key, &serialize_row(&new_row))?;
-            self.update_indexes(&table, rowid, Some(&old_row), &new_row)?;
+            let root = self.table_root(table_name);
+            btree::delete(&mut self.store(), root, key)?;
+            self.write_row(table_name, new_rowid as u64, &serialize_row(&new_row))?;
+            for idx in &table.indexes {
+                self.index_delete(idx, &old_row[idx.column], rowid)?;
+                index::insert(
+                    &mut self.store(),
+                    idx.root_page,
+                    &index_record(&new_row[idx.column], new_rowid),
+                )?;
+            }
+            self.note_rowid_used(table_name, new_rowid);
         }
 
         Ok(QueryResult::with_affected(count))
