@@ -302,6 +302,10 @@ fn insert_recursive(
                     })
                     .collect();
                 new_cells.sort_by(|a, b| a.0.cmp(&b.0));
+                if !leaf_cells_fit(page_offset(&page), &new_cells) {
+                    // The row grew and no longer fits: split like an insert would.
+                    return split_leaf(store, page_num, page, new_cells);
+                }
                 rebuild_leaf_page(&mut page, &new_cells);
                 store.write_page(page_num, page)?;
                 return Ok(InsertResult::Done);
@@ -320,29 +324,7 @@ fn insert_recursive(
             let mut cells = collect_leaf_cells(&page);
             cells.push((key, value.to_vec()));
             cells.sort_by(|a, b| a.0.cmp(&b.0));
-
-            let mid = cells.len() / 2;
-            // SQLite separator key convention: max key of the left subtree.
-            let median_key = cells[mid - 1].0;
-
-            let left_cells = &cells[..mid];
-            let right_cells = &cells[mid..];
-
-            // Reuse current page for left.
-            rebuild_leaf_page(&mut page, left_cells);
-            store.write_page(page_num, page)?;
-
-            // New page for right.
-            let new_page_num = store.allocate_page()?;
-            let mut new_page = [0u8; PAGE_SIZE];
-            init_leaf_page(&mut new_page);
-            rebuild_leaf_page(&mut new_page, right_cells);
-            store.write_page(new_page_num, new_page)?;
-
-            Ok(InsertResult::Split {
-                new_page: new_page_num,
-                median_key,
-            })
+            split_leaf(store, page_num, page, cells)
         }
     } else {
         // Internal node — find the child.
@@ -449,6 +431,75 @@ fn insert_recursive(
             }
         }
     }
+}
+
+/// True if `cells` fit on one leaf page whose B-tree header starts at `hdr_off`.
+fn leaf_cells_fit(hdr_off: usize, cells: &[(u64, Vec<u8>)]) -> bool {
+    let used: usize = cells
+        .iter()
+        .map(|(k, v)| leaf_cell_size(*k, v) + CELL_PTR_SIZE)
+        .sum();
+    hdr_off + LEAF_HEADER_SIZE + used <= PAGE_SIZE
+}
+
+/// Split the sorted `cells` of leaf `page_num` across it and a new right sibling.
+fn split_leaf(
+    store: &mut dyn PageStore,
+    page_num: u32,
+    mut page: [u8; PAGE_SIZE],
+    cells: Vec<(u64, Vec<u8>)>,
+) -> io::Result<InsertResult> {
+    let hdr_off = page_offset(&page);
+    let fits =
+        |mid: usize| leaf_cells_fit(hdr_off, &cells[..mid]) && leaf_cells_fit(0, &cells[mid..]);
+
+    // Split by count, as before; fall back to the most even split by bytes when one
+    // half would overflow (rows of very different sizes).
+    let mut mid = cells.len() / 2;
+    if !fits(mid) {
+        let sizes: Vec<usize> = cells
+            .iter()
+            .map(|(k, v)| leaf_cell_size(*k, v) + CELL_PTR_SIZE)
+            .collect();
+        let total: usize = sizes.iter().sum();
+        let mut left = 0;
+        let mut best = (usize::MAX, mid);
+        for m in 1..cells.len() {
+            left += sizes[m - 1];
+            let worst = left.max(total - left);
+            if worst < best.0 {
+                best = (worst, m);
+            }
+        }
+        mid = best.1;
+        if !fits(mid) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "row too large: overflow pages are not supported",
+            ));
+        }
+    }
+    // SQLite separator key convention: max key of the left subtree.
+    let median_key = cells[mid - 1].0;
+
+    let left_cells = &cells[..mid];
+    let right_cells = &cells[mid..];
+
+    // Reuse current page for left.
+    rebuild_leaf_page(&mut page, left_cells);
+    store.write_page(page_num, page)?;
+
+    // New page for right.
+    let new_page_num = store.allocate_page()?;
+    let mut new_page = [0u8; PAGE_SIZE];
+    init_leaf_page(&mut new_page);
+    rebuild_leaf_page(&mut new_page, right_cells);
+    store.write_page(new_page_num, new_page)?;
+
+    Ok(InsertResult::Split {
+        new_page: new_page_num,
+        median_key,
+    })
 }
 
 /// Delete a key from the tree. Returns true if the key was found and deleted.
@@ -712,6 +763,39 @@ mod tests {
         // Should be sorted.
         for w in all.windows(2) {
             assert!(w[0].0 <= w[1].0);
+        }
+    }
+
+    #[test]
+    fn test_btree_update_grows_row_on_full_leaf() {
+        let mut store = MemStore::new();
+        let mut root = make_root(&mut store);
+
+        // Fill one leaf almost completely with small rows.
+        let mut i = 0u64;
+        while free_space_leaf(&store.read_page(root).unwrap()) > 40 {
+            root = insert(&mut store, root, i, b"0123456789").unwrap();
+            i += 1;
+        }
+        assert!(
+            is_leaf(&store.read_page(root).unwrap()),
+            "should still be one leaf"
+        );
+
+        // Growing one row past the free space must split instead of overlapping cells.
+        let big = vec![b'x'; 200];
+        root = insert(&mut store, root, 3, &big).unwrap();
+        assert!(
+            !is_leaf(&store.read_page(root).unwrap()),
+            "root should have split"
+        );
+        assert_eq!(search(&mut store, root, 3).unwrap(), Some(big));
+        let all = scan_all(&mut store, root).unwrap();
+        assert_eq!(all.len() as u64, i);
+        for (k, v) in &all {
+            if *k != 3 {
+                assert_eq!(v.as_slice(), b"0123456789");
+            }
         }
     }
 
